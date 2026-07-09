@@ -1,0 +1,13 @@
+.env
+**/.env
+*.env
+data/
+data/**
+*.session
+**/*.session
+**/auth.json
+**/.dashboard-password
+__pycache__/
+*.pyc
+.DS_Store.env.save
+.env

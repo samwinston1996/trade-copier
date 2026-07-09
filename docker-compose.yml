@@ -1,0 +1,100 @@
+services:
+
+  # hermes:
+    image: nousresearch/hermes-agent:v2026.7.1
+    container_name: hermes
+    restart: unless-stopped
+    command: gateway run
+    environment:
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${HERMES_API_KEY}
+      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_HOST=127.0.0.1
+      - HERMES_UID=1000
+      - HERMES_GID=1000
+    ports:
+      - "127.0.0.1:8642:8642"
+      - "127.0.0.1:9119:9118"
+    volumes:
+      - ~/.hermes:/opt/data
+      - .:/opt/data/trade-copier
+      - ./router:/workspace/router:rw
+      - ./bridge:/workspace/bridge:rw
+      - ./listener:/workspace/listener:rw
+      - ./scripts:/workspace/scripts:rw
+      - ./data:/workspace/data:rw
+      - ./docker-compose.yml:/workspace/docker-compose.yml:ro
+      - /usr/bin/docker:/usr/bin/docker:rw
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:rw
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    networks: [copier]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9119/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+
+ # hermes-dashboard-proxy:
+    image: alpine/socat
+    container_name: hermes-dashboard-proxy
+    restart: unless-stopped
+    network_mode: "service:hermes"
+    depends_on:
+      hermes:
+        condition: service_healthy
+    command: TCP-LISTEN:9118,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9119
+
+  router:
+    build: ./router
+    container_name: router
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - HERMES_API_URL=http://hermes:8642/v1/chat/completions
+      - BRIDGE_URL=http://mt5:8002  
+    depends_on: [hermes]
+    networks: [copier]
+
+  mt5:
+    image: gmag11/metatrader5_vnc:2.3
+    container_name: mt5
+    restart: unless-stopped
+    environment:
+      - CUSTOM_USER=trader
+      - PASSWORD=${VNC_PASSWORD}
+      - PUID=1000
+      - PGID=1000
+      - MT5_LOGIN=${MT5_LOGIN}
+      - MT5_PASSWORD=${MT5_PASSWORD}
+      - MT5_SERVER=${MT5_SERVER}
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data/mt5:/config
+      - ./mt5/start.sh:/Metatrader/start.sh:ro
+    networks: [copier]
+
+  bridge:
+    build: ./bridge
+    container_name: bridge
+    restart: unless-stopped
+    network_mode: "service:mt5"
+    env_file: .env
+    depends_on: [mt5]
+    command: uvicorn bridge:app --host 0.0.0.0 --port 8002
+
+  listener:
+    build: ./listener
+    container_name: listener
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    depends_on: [router]
+    networks: [copier]
+
+networks:
+  copier:
+    driver: bridge
