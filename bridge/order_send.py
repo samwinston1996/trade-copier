@@ -12,4 +12,6 @@ r = c.order_send(order)
 if r:
     print(f"OK:{r.retcode}:{r.order}")
 else:
-    print("ERR:None")
+    # Capture MT5's last_error before giving up
+    err = c.last_error() if hasattr(c, 'last_error') else ("unknown", "N/A")
+    print(f"ERR:None:order_send returned None — last_error={err}")

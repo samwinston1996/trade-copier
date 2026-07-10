@@ -155,20 +155,21 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
     price = tick.ask if req.action == "BUY" else tick.bid
     entry = req.entry if req.order_type != "market" else price
 
-    # 20-pip rule: if entry is 20+ pips from market, use LIMIT order
-    # Otherwise execute as MARKET at current price
+    # 20-pip rule: bridge decides market vs limit, overriding router's conversion
     pip_size = mt5.symbol_info(symbol).point
     twenty_pips = 20 * pip_size
     final_type = req.order_type
-    if req.entry is not None and abs(req.entry - price) >= twenty_pips:
-        final_type = req.order_type if req.order_type != "market" else "limit"
-        if req.order_type == "market":
-            log.info("entry=%.2f is %.1f pips from market=%.2f — converting market→limit",
-                     req.entry, abs(req.entry - price) / pip_size, price)
-    elif req.order_type == "market" and req.entry is not None and abs(req.entry - price) < twenty_pips:
-        entry = price  # Use market price, ignore entry
-        log.info("entry=%.2f is <20 pips from market=%.2f — executing as MARKET at %.2f",
-                 req.entry, price, price)
+    if req.entry is not None:
+        if abs(req.entry - price) >= twenty_pips:
+            final_type = "limit"
+            entry = req.entry
+            log.info("entry=%.2f is %.1f pips from market=%.2f — LIMIT at %.2f",
+                     req.entry, abs(req.entry - price) / pip_size, price, entry)
+        else:
+            final_type = "market"
+            entry = price
+            log.info("entry=%.2f is <20 pips from market=%.2f — MARKET at %.2f",
+                     req.entry, price, price)
 
     if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
         raise HTTPException(400, "SL on wrong side of entry — bad parse or bad signal")
@@ -232,7 +233,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             _mt5 = None  # Force reconnection
             mt5 = ensure_mt5()
             time.sleep(1.0)
-            log.info("Sending order to MT5: action=%s type=%s ...",
+            log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s (fallback after subprocess None)",
                      order.get("action"), order.get("type"), order.get("symbol"),
                      order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
             res = mt5.order_send(order)
