@@ -163,10 +163,17 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
     final_type = req.order_type
     if req.entry is not None:
         if abs(req.entry - price) >= twenty_pips:
-            final_type = "limit"
             entry = req.entry
-            log.info("entry=%.2f is %.1f pips from market=%.2f — LIMIT at %.2f",
-                     req.entry, abs(req.entry - price) / pip_size, price, entry)
+            # BUY: entry below market → LIMIT, above → STOP
+            # SELL: entry above market → LIMIT, below → STOP
+            if (req.action == "BUY" and req.entry < price) or (req.action == "SELL" and req.entry > price):
+                final_type = "limit"
+                log.info("entry=%.2f is %.1f pips from market=%.2f — LIMIT at %.2f",
+                         req.entry, abs(req.entry - price) / pip_size, price, entry)
+            else:
+                final_type = "stop"
+                log.info("entry=%.2f is %.1f pips from market=%.2f — STOP at %.2f",
+                         req.entry, abs(req.entry - price) / pip_size, price, entry)
         else:
             final_type = "market"
             entry = price
