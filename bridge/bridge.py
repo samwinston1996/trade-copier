@@ -103,20 +103,13 @@ def daily_loss_exceeded() -> bool:
     return sum(d.profit for d in deals) < -(acct.balance * MAX_DAILY_LOSS_PCT / 100)
 
 def calc_lot(symbol: str, entry: float, sl: float, risk_pct: float) -> float:
+    """Step-based lot sizing: balance/100 → lots, min 0.01."""
     mt5 = get_mt5()
     acct = mt5.account_info()
     info = mt5.symbol_info(symbol)
-
-    risk_money = acct.balance * risk_pct / 100
-    loss_per_lot = (abs(entry - sl) / info.trade_tick_size) * info.trade_tick_value
-    if loss_per_lot <= 0:
-        raise HTTPException(400, "cannot compute lot size")
-
-    step = info.volume_step
-    lot = max(
-        info.volume_min,
-        min(info.volume_max, round((risk_money / loss_per_lot) / step) * step),
-    )
+    step = max(int(acct.balance / 100), 0)
+    lot = 0.01 + step * 0.01
+    lot = max(info.volume_min, min(info.volume_max, round(lot / info.volume_step) * info.volume_step))
     return round(lot, 2)
 
 
@@ -146,6 +139,12 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
 
     if req.signal_id in executed_signals:
         return {"status": "duplicate_ignored"}
+
+    if not req.tp or all(t == 0 for t in req.tp):
+        raise HTTPException(400, "TP is required — every trade needs a take profit")
+
+    if req.sl is None or req.sl == 0:
+        raise HTTPException(400, "SL is required — every trade needs a stop loss")
 
     if daily_loss_exceeded():
         raise HTTPException(423, "DAILY LOSS CAP HIT — trading disabled today")
@@ -196,10 +195,18 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             "magic": MAGIC,
             "comment": f"{req.comment}|{req.signal_id}"[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
         }
 
         res = mt5.order_send(order)
+        if res is None:
+            log.warning("order_send returned None for %s %s lot=%s tp=%s — retrying once", req.action, symbol, lot_each, tp)
+            time.sleep(1.0)
+            res = mt5.order_send(order)
+        if res is None:
+            log.error("order_send returned None again for %s %s — aborting", req.action, symbol)
+            results.append({"retcode": -1, "order": 0, "tp": tp, "error": "MT5 RPC returned None"})
+            continue
         if res.retcode == mt5.TRADE_RETCODE_REQUOTE:
             time.sleep(0.5)
             res = mt5.order_send(order)
@@ -238,7 +245,7 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
                     "price": tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask,
                     "deviation": 20,
                     "magic": MAGIC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_filling": mt5.ORDER_FILLING_FOK,
                 }
             )
         else:

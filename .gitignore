@@ -7,6 +7,7 @@ data/**
 **/*.session
 **/auth.json
 **/.dashboard-password
+.env.save
 __pycache__/
 *.pyc
 .DS_Store.env.save

@@ -57,3 +57,45 @@ This stack follows a strict staged rollout via the Jarvis ecosystem:
 - **Observe-only by default** — no live orders without explicit per-trade confirmation
 - **Kill switch** — cuts the connection immediately on anomaly detection
 - **Position size limits** — hard caps enforced at the bridge level
+
+## Signal Parsing
+
+The router supports **two parsing pathways** to handle both text and image-based signals:
+
+| Pathway | Model | When |
+|---------|-------|------|
+| **Text** | `deepseek/deepseek-v4-flash` (configurable) | Plain text messages from the channel |
+| **Image** | `google/gemini-3.1-flash-lite-preview` (configurable) | Messages with chart screenshots showing coloured SL/TP levels |
+
+The listener automatically downloads images from Telegram messages, base64-encodes them, and sends them to the router. The router detects the presence of image data and routes to the appropriate model with the correct prompt.
+
+### Configuration
+
+All sensitive config is managed via `.env` (never committed).
+
+**Required:**
+
+| Variable | Description |
+|----------|-------------|
+| `TG_API_ID` | Telegram API ID (from my.telegram.org) |
+| `TG_API_HASH` | Telegram API hash |
+| `HERMES_WEBHOOK_URL` | Router webhook URL (`http://router:8000/webhook`) |
+| `HERMES_WEBHOOK_TOKEN` | Shared secret for listener→router auth |
+| `HERMES_API_URL` | Hermes/OpenRouter API endpoint |
+| `HERMES_API_KEY` | Hermes/OpenRouter API key |
+| `BRIDGE_TOKEN` | Shared secret for router→bridge auth |
+| `MT5_LOGIN` | MT5 account login |
+| `MT5_PASSWORD` | MT5 account password |
+| `MT5_SERVER` | MT5 broker server |
+
+**Optional:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VISION_MODEL` | `google/gemini-3.1-flash-lite-preview` | Model for image signal parsing |
+| `TEXT_MODEL` | `deepseek/deepseek-v4-flash` | Model for text signal parsing |
+| `MIN_CONFIDENCE` | `0.8` | Minimum confidence to auto-forward |
+| `MAX_IMAGE_KB` | `512` | Max image size to download (listener) |
+| `ALERT_BOT_TOKEN` | — | Telegram bot token for alerts |
+| `ALERT_CHAT_ID` | — | Chat ID for alert delivery |
+| `RISK_PERCENT` | `1.0` | Risk per trade (bridge) |
