@@ -55,8 +55,9 @@ Rules:
 - Determine direction:
   * If RED zone is ABOVE and Grey zone is BELOW the entry → action = SELL
   * If Grey zone is ABOVE and RED zone is BELOW the entry → action = BUY
-- Read the exact price labels on the Y-axis for entry, SL, and TP levels.
-- If you cannot read ANY price level on the chart, set action = IGNORE and confidence = 0.0.
+|- Read the exact price labels on the Y-axis for entry, SL, and TP levels.
+|- For SL and TP accuracy: the right-hand price panel shows boxed price indicators. A RED box = SL price at the far edge of the red zone. A GREY box = TP price at the far boundary of the grey zone. Read these boxed values from the right panel instead of guessing from zone boundaries.
+|- If you cannot read ANY price level on the chart
 - NEVER invent prices. Only report levels you can clearly read from chart labels.
 - A valid signal MUST have a clearly readable entry, SL, and TP. If any is missing/unreadable, set confidence <= 0.3.
 - confidence: 1.0 if you read entry, SL, and TP clearly. 0.5 if only two are clear. 0.0 if nothing readable."""
