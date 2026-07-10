@@ -195,16 +195,19 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             "magic": MAGIC,
             "comment": f"{req.comment}|{req.signal_id}"[:31],
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK,
         }
+        if is_market:
+            order["type_filling"] = mt5.ORDER_FILLING_FOK
 
         res = mt5.order_send(order)
         if res is None:
-            log.warning("order_send returned None for %s %s lot=%s tp=%s — retrying once", req.action, symbol, lot_each, tp)
+            log.warning("order_send returned None for %s %s lot=%s tp=%s — reconnecting MT5", req.action, symbol, lot_each, tp)
+            _mt5 = None  # Force reconnection
+            mt5 = ensure_mt5()
             time.sleep(1.0)
             res = mt5.order_send(order)
         if res is None:
-            log.error("order_send returned None again for %s %s — aborting", req.action, symbol)
+            log.error("order_send returned None again after reconnect for %s %s — aborting", req.action, symbol)
             results.append({"retcode": -1, "order": 0, "tp": tp, "error": "MT5 RPC returned None"})
             continue
         if res.retcode == mt5.TRADE_RETCODE_REQUOTE:
