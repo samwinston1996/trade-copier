@@ -59,13 +59,8 @@ def auth(authorization: Optional[str]):
 
 def get_mt5(retries: int = 30, delay: int = 2):
     """
-    Lazy-connect to mt5linux server on localhost:8001.
-    This avoids crashing at import time if MT5/Wine is still booting.
+    Create a fresh MT5 connection. No caching — each call gets a new client.
     """
-    global _mt5
-    if _mt5 is not None:
-        return _mt5
-
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -160,6 +155,21 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
     price = tick.ask if req.action == "BUY" else tick.bid
     entry = req.entry if req.order_type != "market" else price
 
+    # 20-pip rule: if entry is 20+ pips from market, use LIMIT order
+    # Otherwise execute as MARKET at current price
+    pip_size = mt5.symbol_info(symbol).point
+    twenty_pips = 20 * pip_size
+    final_type = req.order_type
+    if req.entry is not None and abs(req.entry - price) >= twenty_pips:
+        final_type = req.order_type if req.order_type != "market" else "limit"
+        if req.order_type == "market":
+            log.info("entry=%.2f is %.1f pips from market=%.2f — converting market→limit",
+                     req.entry, abs(req.entry - price) / pip_size, price)
+    elif req.order_type == "market" and req.entry is not None and abs(req.entry - price) < twenty_pips:
+        entry = price  # Use market price, ignore entry
+        log.info("entry=%.2f is <20 pips from market=%.2f — executing as MARKET at %.2f",
+                 req.entry, price, price)
+
     if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
         raise HTTPException(400, "SL on wrong side of entry — bad parse or bad signal")
 
@@ -177,7 +187,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
         ("SELL", "stop"): mt5.ORDER_TYPE_SELL_STOP,
     }
 
-    is_market = req.order_type == "market"
+    is_market = final_type == "market"
     tps = req.tp or [0.0]
     lot_each = round(max(mt5.symbol_info(symbol).volume_min, lot / len(tps)), 2)
 
@@ -187,7 +197,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             "action": mt5.TRADE_ACTION_DEAL if is_market else mt5.TRADE_ACTION_PENDING,
             "symbol": symbol,
             "volume": lot_each,
-            "type": tmap[(req.action, req.order_type)],
+            "type": tmap[(req.action, final_type)],
             "price": price if is_market else entry,
             "sl": req.sl,
             "tp": tp,
@@ -199,14 +209,26 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
         if is_market:
             order["type_filling"] = mt5.ORDER_FILLING_FOK
 
-        res = mt5.order_send(order)
+        log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s",
+                     order.get("action"), order.get("type"), order.get("symbol"),
+                     order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
+        try:
+            res = mt5.order_send(order)
+        except Exception as e:
+            log.error("order_send exception: %s", e)
+            res = None
         if res is None:
+            log.error("order_send returned None — order=%s", order)
             log.warning("order_send returned None for %s %s lot=%s tp=%s — reconnecting MT5", req.action, symbol, lot_each, tp)
             _mt5 = None  # Force reconnection
             mt5 = ensure_mt5()
             time.sleep(1.0)
+            log.info("Sending order to MT5: action=%s type=%s ...",
+                     order.get("action"), order.get("type"), order.get("symbol"),
+                     order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
             res = mt5.order_send(order)
         if res is None:
+            log.error("order_send returned None — order=%s", order)
             log.error("order_send returned None again after reconnect for %s %s — aborting", req.action, symbol)
             results.append({"retcode": -1, "order": 0, "tp": tp, "error": "MT5 RPC returned None"})
             continue
