@@ -203,7 +203,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             "tp": tp,
             "deviation": 20,
             "magic": MAGIC,
-            "comment": f"{req.comment}|{req.signal_id}"[:31],
+            "comment": f"{req.comment}|{req.signal_id}"[:31].replace("|", "-"),
             "type_time": mt5.ORDER_TIME_GTC,
         }
         if is_market:
