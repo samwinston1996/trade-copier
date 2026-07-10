@@ -27,6 +27,8 @@ MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES", 5))
 MAGIC = 777001
 
 SYMBOL_MAP = {"GOLD": "XAUUSD", "XAU": "XAUUSD", "DOW": "US30", "NAS": "NAS100"}
+# Pip size per symbol (point * pip_multiplier). XAUUSD=0.10, US30/NAS100=1.0
+PIP_SIZES = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
 
 app = FastAPI(title="MT5 Bridge")
 executed_signals: set[str] = set()
@@ -156,7 +158,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
     entry = req.entry if req.order_type != "market" else price
 
     # 20-pip rule: bridge decides market vs limit, overriding router's conversion
-    pip_size = mt5.symbol_info(symbol).point
+    pip_size = PIP_SIZES.get(symbol, mt5.symbol_info(symbol).point * 10)
     twenty_pips = 20 * pip_size
     final_type = req.order_type
     if req.entry is not None:
