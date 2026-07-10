@@ -40,22 +40,26 @@ Rules:
 - confidence reflects how certain you are the parse is a real, complete, actionable signal.
 - A valid BUY/SELL signal MUST have both SL and TP. Without both, it is incomplete."""
 
-IMAGE_SYSTEM_PROMPT = """You are a trade-signal parser for CHART IMAGES. Input: a screenshot of a trading chart with coloured horizontal levels.
+IMAGE_SYSTEM_PROMPT = """You are a trade-signal parser for CHART IMAGES. Input: a screenshot of a trading chart with two adjacent shaded zones.
 Output: ONLY a single JSON object, no prose, no markdown fences.
 Schema:
-{"action":"BUY|SELL|IGNORE","symbol":"XAUUSD","order_type":"market","entry":null,"sl":number|null,"tp":[number]|null,"confidence":0.0-1.0}
+{"action":"BUY|SELL|IGNORE","symbol":"XAUUSD","order_type":"limit","entry":number,"sl":number,"tp":[number],"confidence":0.0-1.0}
 
 Rules:
-- The chart shows XAUUSD (Gold). Always output symbol "XAUUSD".
-- Read the exact price labels on the Y-axis for SL and TP levels.
-- RED horizontal line(s) = Stop Loss (SL). Report the exact price.
-- GREEN horizontal line(s) = Take Profit (TP). Report all distinct TP levels as an array.
-- If there is a horizontal line in YELLOW, CYAN, or WHITE near the current price, that is the ENTRY zone — leave entry as null (market order).
-- Determine direction: if TP is ABOVE the current price area, action = BUY. If TP is BELOW, action = SELL.
+- The chart shows XAUUSD (Gold). Always output symbol "XAUUSD" and order_type "limit".
+- The chart has two adjacent shaded zones separated by a horizontal border line:
+  * RED shaded zone = Stop Loss zone. The SL price is at the FAR edge of the red zone (the side opposite the entry border).
+  * Grey shaded zone = Trade direction / profit zone. The trade moves in this direction.
+- The ENTRY price is the horizontal border line between the RED zone and the Grey zone.
+- Take Profit (TP): The far boundary line of the Grey zone. Output only ONE TP price.
+- Determine direction:
+  * If RED zone is ABOVE and Grey zone is BELOW the entry → action = SELL
+  * If Grey zone is ABOVE and RED zone is BELOW the entry → action = BUY
+- Read the exact price labels on the Y-axis for entry, SL, and TP levels.
 - If you cannot read ANY price level on the chart, set action = IGNORE and confidence = 0.0.
 - NEVER invent prices. Only report levels you can clearly read from chart labels.
-- A valid BUY/SELL MUST have at least one clearly readable TP and one clearly readable SL. If either is missing/unreadable, set confidence <= 0.3.
-- confidence: 1.0 if you read SL and TP clearly. 0.5 if only one is clear. 0.0 if nothing readable."""
+- A valid signal MUST have a clearly readable entry, SL, and TP. If any is missing/unreadable, set confidence <= 0.3.
+- confidence: 1.0 if you read entry, SL, and TP clearly. 0.5 if only two are clear. 0.0 if nothing readable."""
 
 app = FastAPI(title="Signal Router")
 
@@ -151,7 +155,9 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         raise HTTPException(401, "bad token")
 
     # Route to the right parser based on content type
+    is_image = False
     if ev.image_data and len(ev.image_data) > 100:
+        is_image = True
         log.info("Routing msg %s to VISION parser (%s b64 chars)", ev.message_id, len(ev.image_data))
         try:
             sig = await parse_image_signal(ev.image_data, ev.text)
@@ -188,8 +194,15 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 "tp": sig.get("tp") or [],
                 "signal_id": f"{ev.channel_title or ev.channel_id}:{ev.message_id}",
                 "comment": ev.channel_title or "signal",
+                "from_image": is_image,
             }
-            if body["entry"] is not None and body["order_type"] == "market":
+            if is_image and body["entry"] is not None:
+                # Add 100-pip TP in trade direction as TP1 (closer target)
+                hundred_pips = 10.0  # 100 pips × 0.10 for XAUUSD
+                extra_tp = body["entry"] - hundred_pips if action == "SELL" else body["entry"] + hundred_pips
+                body["tp"] = [round(extra_tp, 2)] + (body["tp"] or [])
+                log.info("Added 100-pip TP at %.2f for image signal", extra_tp)
+            if body["entry"] is not None and body["order_type"] == "market" and not is_image:
                 body["order_type"] = "limit"
                 log.info("entry=%.2f specified — converting market->limit", body["entry"])
             r = await c.post(f"{BRIDGE_URL}/trade", json=body, headers=headers)

@@ -46,6 +46,7 @@ class TradeRequest(BaseModel):
     risk_percent: Optional[float] = None
     comment: str = "tg-copier"
     signal_id: str
+    from_image: bool = False
 
 
 class ManageRequest(BaseModel):
@@ -175,10 +176,22 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
                 log.info("entry=%.2f is %.1f pips from market=%.2f — STOP at %.2f",
                          req.entry, abs(req.entry - price) / pip_size, price, entry)
         else:
-            final_type = "market"
-            entry = price
-            log.info("entry=%.2f is <20 pips from market=%.2f — MARKET at %.2f",
-                     req.entry, price, price)
+            if req.from_image:
+                # Image signals: keep as pending order even if <20 pips from market
+                entry = req.entry
+                if (req.action == "BUY" and req.entry < price) or (req.action == "SELL" and req.entry > price):
+                    final_type = "limit"
+                    log.info("entry=%.2f is %.1f pips from market=%.2f — IMAGE LIMIT at %.2f",
+                             req.entry, abs(req.entry - price) / pip_size, price, entry)
+                else:
+                    final_type = "stop"
+                    log.info("entry=%.2f is %.1f pips from market=%.2f — IMAGE STOP at %.2f",
+                             req.entry, abs(req.entry - price) / pip_size, price, entry)
+            else:
+                final_type = "market"
+                entry = price
+                log.info("entry=%.2f is <20 pips from market=%.2f — MARKET at %.2f",
+                         req.entry, price, price)
 
     if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
         raise HTTPException(400, "SL on wrong side of entry — bad parse or bad signal")
