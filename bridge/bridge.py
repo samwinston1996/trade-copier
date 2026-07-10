@@ -212,11 +212,19 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
         log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s",
                      order.get("action"), order.get("type"), order.get("symbol"),
                      order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
-        time.sleep(0.2)  # Small delay to stabilize RPC
-        try:
-            res = mt5.order_send(order)
-        except Exception as e:
-            log.error("order_send exception: %s", e)
+        import subprocess, json as _json
+        order_json = _json.dumps(order)
+        sp = subprocess.run(
+            ["python3", "/app/order_send.py", order_json,
+             os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
+            capture_output=True, text=True, timeout=30)
+        out = sp.stdout.strip()
+        log.info("order_send subprocess: %s", out)
+        if out.startswith("OK:"):
+            parts = out.split(":")
+            res = type("obj", (), {"retcode": int(parts[1]), "order": int(parts[2])})()
+        else:
+            log.error("order_send subprocess failed: %s", sp.stderr[:300])
             res = None
         if res is None:
             log.error("order_send returned None — order=%s", order)
