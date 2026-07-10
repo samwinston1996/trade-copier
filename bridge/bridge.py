@@ -87,8 +87,8 @@ def ensure_mt5():
     return mt5
 
 
-def daily_loss_exceeded() -> bool:
-    mt5 = get_mt5()
+def daily_loss_exceeded(mt5_client=None) -> bool:
+    mt5 = mt5_client if mt5_client else get_mt5()
     acct = mt5.account_info()
     now = datetime.now(timezone.utc)
     sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -97,9 +97,9 @@ def daily_loss_exceeded() -> bool:
     deals = mt5.history_deals_get(sod_ts, now_ts) or []
     return sum(d.profit for d in deals) < -(acct.balance * MAX_DAILY_LOSS_PCT / 100)
 
-def calc_lot(symbol: str, entry: float, sl: float, risk_pct: float) -> float:
+def calc_lot(symbol: str, entry: float, sl: float, risk_pct: float, mt5_client=None) -> float:
     """Step-based lot sizing: balance/100 → lots, min 0.01."""
-    mt5 = get_mt5()
+    mt5 = mt5_client if mt5_client else get_mt5()
     acct = mt5.account_info()
     info = mt5.symbol_info(symbol)
     step = max(int(acct.balance / 100), 0)
@@ -141,7 +141,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
     if req.sl is None or req.sl == 0:
         raise HTTPException(400, "SL is required — every trade needs a stop loss")
 
-    if daily_loss_exceeded():
+    if daily_loss_exceeded(mt5_client=mt5):
         raise HTTPException(423, "DAILY LOSS CAP HIT — trading disabled today")
 
     if len(mt5.positions_get() or []) >= MAX_OPEN_TRADES:
@@ -176,7 +176,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
     if req.order_type == "market" and req.entry and abs(price - req.entry) / price > 0.005:
         raise HTTPException(400, "market moved >0.5% since signal — rejected (stale)")
 
-    lot = calc_lot(symbol, entry, req.sl, req.risk_percent or RISK_PERCENT)
+    lot = calc_lot(symbol, entry, req.sl, req.risk_percent or RISK_PERCENT, mt5_client=mt5)
 
     tmap = {
         ("BUY", "market"): mt5.ORDER_TYPE_BUY,
@@ -212,6 +212,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
         log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s",
                      order.get("action"), order.get("type"), order.get("symbol"),
                      order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
+        time.sleep(0.2)  # Small delay to stabilize RPC
         try:
             res = mt5.order_send(order)
         except Exception as e:
