@@ -41,7 +41,7 @@ class TradeRequest(BaseModel):
     symbol: str
     order_type: Literal["market", "limit", "stop"] = "market"
     entry: Optional[float] = None
-    sl: float
+    sl: Optional[float] = None
     tp: List[float] = Field(default_factory=list)
     risk_percent: Optional[float] = None
     comment: str = "tg-copier"
@@ -53,6 +53,11 @@ class ManageRequest(BaseModel):
     signal_id: str
     op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl"]
     value: Optional[float] = None
+
+
+class CancelPendingRequest(BaseModel):
+    comment: Optional[str] = None
+    symbol: Optional[str] = None
 
 
 def auth(authorization: Optional[str]):
@@ -320,3 +325,29 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
         out.append({"ticket": p.ticket, "retcode": res.retcode})
 
     return {"status": "done", "results": out}
+
+
+@app.post("/cancel_pending")
+def cancel_pending(req: CancelPendingRequest, authorization: Optional[str] = Header(None)):
+    auth(authorization)
+    mt5 = get_mt5()
+    if not mt5.initialize(
+        login=int(os.environ["MT5_LOGIN"]),
+        password=os.environ["MT5_PASSWORD"],
+        server=os.environ["MT5_SERVER"],
+    ):
+        raise HTTPException(503, f"MT5 init failed: {mt5.last_error()}")
+
+    orders = mt5.orders_get() or []
+    cancelled = []
+    for o in orders:
+        if req.comment and req.comment not in (o.comment or ""):
+            continue
+        if req.symbol and o.symbol != req.symbol:
+            continue
+        res = mt5.order_delete(o.ticket)
+        rc = res.retcode if res else -1
+        cancelled.append({"ticket": o.ticket, "symbol": o.symbol, "retcode": rc})
+        log.info("Cancelled pending order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
+
+    return {"status": "done", "cancelled": cancelled}

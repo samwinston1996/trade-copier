@@ -23,6 +23,9 @@ ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")
 
 TEXT_MODEL = os.environ.get("TEXT_MODEL", "deepseek/deepseek-v4-flash")
 VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-3.1-flash-lite-preview")
+# Only channels listed here process IMAGE signals (chart screenshots).
+# All other channels with images are treated as TEXT (decorative screenshots).
+IMAGE_CHANNEL_IDS = [int(c.strip()) for c in os.environ.get("IMAGE_CHANNEL_IDS", "").split(",") if c.strip()]
 
 # ── Two distinct prompts ──────────────────────────────────────────
 
@@ -34,9 +37,11 @@ Schema:
  "partial_pct":number|null,"confidence":0.0-1.0}
 Rules:
 - Normalize symbols: GOLD/XAU -> XAUUSD, DOW -> US30, NAS -> NAS100. Uppercase.
-- Commentary, recaps, ads, results screenshots, greetings -> action IGNORE.
+- Commentary, recaps, ads, results screenshots, greetings, "Good morning", "XAU/USD ANALYSIS", market views -> action IGNORE.
 - NEVER invent prices. If SL or TP is missing for BUY/SELL, set confidence <= 0.3.
 - "close", "take profit now", "secure partials", "SL to breakeven", "move SL to X" -> CLOSE or MODIFY with manage_op.
+- Common signal format: "Entry: X", "Stop Loss: X" (or "SL: X"), "TP1: X" (or "Target: X", "TP: X"). Parse these correctly.
+- For structured text signals with labeled fields (Entry:, Stop Loss:, TP:), extract the exact numbers after each label.
 - confidence reflects how certain you are the parse is a real, complete, actionable signal.
 - A valid BUY/SELL signal MUST have both SL and TP. Without both, it is incomplete."""
 
@@ -47,6 +52,7 @@ Schema:
 
 Rules:
 - The chart shows XAUUSD (Gold). Always output symbol "XAUUSD" and order_type "limit".
+- Genuine trade signals contain the keywords "BULLISH SETUP" or "BEARISH SETUP" in the image or caption. If neither keyword is present, this is likely a results screenshot or market commentary — set confidence <= 0.3 and action IGNORE.
 - The chart has two adjacent shaded zones separated by a horizontal border line:
   * RED shaded zone = Stop Loss zone. The SL price is at the FAR edge of the red zone (the side opposite the entry border).
   * Grey shaded zone = Trade direction / profit zone. The trade moves in this direction.
@@ -55,11 +61,11 @@ Rules:
 - Determine direction:
   * If RED zone is ABOVE and Grey zone is BELOW the entry → action = SELL
   * If Grey zone is ABOVE and RED zone is BELOW the entry → action = BUY
-|- Read the exact price labels on the Y-axis for entry, SL, and TP levels.
-|- For SL and TP accuracy: the right-hand price panel shows boxed price indicators. A RED box = SL price at the far edge of the red zone. A GREY box = TP price at the far boundary of the grey zone. Read these boxed values from the right panel instead of guessing from zone boundaries.
-|- If you cannot read ANY price level on the chart
+- Read the exact price labels on the Y-axis for entry, SL, and TP levels.
+- For SL and TP accuracy: the right-hand price panel shows boxed price indicators. A RED box = SL price at the far edge of the red zone. A GREY box = TP price at the far boundary of the grey zone. Read these boxed values from the right panel instead of guessing from zone boundaries.
 - NEVER invent prices. Only report levels you can clearly read from chart labels.
 - A valid signal MUST have a clearly readable entry, SL, and TP. If any is missing/unreadable, set confidence <= 0.3.
+- A valid trading signal should have SL at least 50 pips (5.0 points) away from entry. If the SL is very close to entry (<50 pips), it is likely a results screenshot or filled trade — set confidence <= 0.3 and action IGNORE.
 - confidence: 1.0 if you read entry, SL, and TP clearly. 0.5 if only two are clear. 0.0 if nothing readable."""
 
 app = FastAPI(title="Signal Router")
@@ -155,17 +161,22 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if authorization != f"Bearer {WEBHOOK_TOKEN}":
         raise HTTPException(401, "bad token")
 
-    # Route to the right parser based on content type
+    # Route to the right parser based on channel type and content
     is_image = False
-    if ev.image_data and len(ev.image_data) > 100:
+    has_image = ev.image_data and len(ev.image_data) > 100
+    is_image_channel = ev.channel_id in IMAGE_CHANNEL_IDS
+
+    if has_image and is_image_channel:
         is_image = True
-        log.info("Routing msg %s to VISION parser (%s b64 chars)", ev.message_id, len(ev.image_data))
+        log.info("Routing msg %s to VISION parser (image channel, %s b64 chars)", ev.message_id, len(ev.image_data))
         try:
             sig = await parse_image_signal(ev.image_data, ev.text)
         except Exception as e:
             await alert(f"Image parse failed for {ev.channel_id}:{ev.message_id}\n{e}")
             raise HTTPException(502, f"image parse failed: {e}")
     elif ev.text.strip():
+        if has_image and not is_image_channel:
+            log.info("Channel %s has image but not in IMAGE_CHANNEL_IDS — routing to TEXT parser", ev.channel_id)
         log.info("Routing msg %s to TEXT parser", ev.message_id)
         try:
             sig = await parse_text_signal(ev.text)
@@ -183,9 +194,40 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if action == "IGNORE":
         return {"status": "ignored", "signal": sig}
 
+    # Guard: reject BUY/SELL with missing SL or low confidence
+    if action in ("BUY", "SELL"):
+        if sig.get("sl") is None:
+            log.warning("Rejected %s:%s — SL missing, conf=%.2f", ev.channel_id, ev.message_id, conf)
+            return {"status": "ignored", "reason": "SL missing from signal"}
+        if conf < 0.5:
+            log.warning("Rejected %s:%s — confidence %.2f below 0.5", ev.channel_id, ev.message_id, conf)
+            return {"status": "ignored", "reason": f"confidence {conf:.2f} below 0.5"}
+
+    # Guard: image signals must have SL at least 50 pips from entry
+    if is_image and action in ("BUY", "SELL"):
+        symbol = sig.get("symbol", "XAUUSD")
+        pip_sizes = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
+        pip_size = pip_sizes.get(symbol, 0.10)
+        sl_distance = abs(sig["entry"] - sig["sl"]) / pip_size
+        if sl_distance < 50:
+            log.warning("Rejected image signal %s:%s — SL only %.0f pips from entry (min 50)", ev.channel_id, ev.message_id, sl_distance)
+            await alert(f"Trade.inn signal rejected: SL too tight ({sl_distance:.0f} pips, min 50)")
+            return {"status": "ignored", "reason": f"SL too tight: {sl_distance:.0f} pips (min 50)"}
+
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
     async with httpx.AsyncClient(timeout=30) as c:
         if action in ("BUY", "SELL"):
+            # Cancel any pending orders from this channel before placing new one
+            cancel_body = {"comment": ev.channel_title or "signal"}
+            try:
+                cancel_resp = await c.post(f"{BRIDGE_URL}/cancel_pending", json=cancel_body, headers=headers, timeout=10)
+                if cancel_resp.status_code < 400:
+                    cancelled = cancel_resp.json().get("cancelled", [])
+                    if cancelled:
+                        log.info("Cancelled %d pending orders for channel '%s' before new signal", len(cancelled), ev.channel_title)
+            except Exception as e:
+                log.warning("cancel_pending call failed (non-fatal): %s", e)
+
             body = {
                 "action": action,
                 "symbol": sig.get("symbol", "XAUUSD"),

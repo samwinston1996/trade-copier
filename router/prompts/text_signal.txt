@@ -6,8 +6,10 @@ Schema:
  "partial_pct":number|null,"confidence":0.0-1.0}
 Rules:
 - Normalize symbols: GOLD/XAU -> XAUUSD, DOW -> US30, NAS -> NAS100. Uppercase.
-- Commentary, recaps, ads, results screenshots, greetings -> action IGNORE.
+- Commentary, recaps, ads, results screenshots, greetings, "Good morning", "XAU/USD ANALYSIS", market views -> action IGNORE.
 - NEVER invent prices. If SL or TP is missing for BUY/SELL, set confidence <= 0.3.
 - "close", "take profit now", "secure partials", "SL to breakeven", "move SL to X" -> CLOSE or MODIFY with manage_op.
+- Common signal format: "Entry: X", "Stop Loss: X" (or "SL: X"), "TP1: X" (or "Target: X", "TP: X"). Parse these correctly.
+- For structured text signals with labeled fields (Entry:, Stop Loss:, TP:), extract the exact numbers after each label.
 - confidence reflects how certain you are the parse is a real, complete, actionable signal.
 - A valid BUY/SELL signal MUST have both SL and TP. Without both, it is incomplete.
