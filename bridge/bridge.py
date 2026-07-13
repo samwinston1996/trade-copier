@@ -345,8 +345,24 @@ def cancel_pending(req: CancelPendingRequest, authorization: Optional[str] = Hea
             continue
         if req.symbol and o.symbol != req.symbol:
             continue
-        res = mt5.order_delete(o.ticket)
-        rc = res.retcode if res else -1
+        remove_order = {
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": o.ticket,
+            "symbol": o.symbol,
+        }
+        import subprocess, json as _json
+        order_json = _json.dumps(remove_order)
+        sp = subprocess.run(
+            ["python3", "/app/order_send.py", order_json,
+             os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
+            capture_output=True, text=True, timeout=15)
+        out = sp.stdout.strip()
+        if out.startswith("OK:"):
+            parts = out.split(":")
+            rc = int(parts[1])
+        else:
+            log.error("cancel_pending subprocess failed: %s", sp.stderr[:200])
+            rc = -1
         cancelled.append({"ticket": o.ticket, "symbol": o.symbol, "retcode": rc})
         log.info("Cancelled pending order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
 
