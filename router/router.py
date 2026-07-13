@@ -62,11 +62,12 @@ Rules:
   * If RED zone is ABOVE and Grey zone is BELOW the entry → action = SELL
   * If Grey zone is ABOVE and RED zone is BELOW the entry → action = BUY
 - Read the exact price labels on the Y-axis for entry, SL, and TP levels.
-- For ALL price levels, use the right-hand price panel — it shows boxed prices horizontally aligned with each zone boundary:
-  * RED box = SL price — aligned with the far edge of the RED zone
-  * GREY box at the border = ENTRY price — aligned with the border line between the RED zone and the Grey zone
-  * GREY box at the far end = TP price — aligned with the far boundary of the Grey zone
-- Read these boxed values from the right panel. Do NOT guess from Y-axis labels or zone boundary intersections — the right panel boxes are the ground truth.
+- For accuracy: the right panel shows boxed price indicators.
+  - SL price = the RED box in the right panel, horizontally aligned with the far edge of the RED zone
+  - ENTRY price = the GREY box in the right panel, horizontally aligned with the border line between the RED zone and the Grey zone
+  - TP price = the GREY box in the right panel, horizontally aligned with the far boundary of the Grey zone
+- There may be multiple boxed prices on the right panel. Only use the ones matching the alignment rules above. Ignore all other boxes.
+- Do not guess prices from the right panel labels. The boxes aligned with the zone boundaries are the true SL, ENTRY, and TP prices.
 - NEVER invent prices. Only report levels you can clearly read from chart labels.
 - A valid signal MUST have a clearly readable entry, SL, and TP. If any is missing/unreadable, set confidence <= 0.3.
 - A valid trading signal should have SL at least 50 pips (5.0 points) away from entry. If the SL is very close to entry (<50 pips), it is likely a results screenshot or filled trade — set confidence <= 0.3 and action IGNORE.
