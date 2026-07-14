@@ -10,6 +10,7 @@ Risk gates are deterministic Python. Hermes/the LLM cannot bypass them.
 import os
 import time
 import logging
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal
 
@@ -29,6 +30,14 @@ MAGIC = 777001
 SYMBOL_MAP = {"GOLD": "XAUUSD", "XAU": "XAUUSD", "DOW": "US30", "NAS": "NAS100"}
 # Pip size per symbol (point * pip_multiplier). XAUUSD=0.10, US30/NAS100=1.0
 PIP_SIZES = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
+
+
+def sanitize_comment(comment: str) -> str:
+    """Normalize Unicode bold/italic chars to plain ASCII for MT5 compatibility."""
+    if not comment:
+        return comment
+    return unicodedata.normalize("NFKC", comment).strip()
+
 
 app = FastAPI(title="MT5 Bridge")
 executed_signals: set[str] = set()
@@ -231,7 +240,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             "tp": tp,
             "deviation": 20,
             "magic": MAGIC,
-            "comment": req.comment[:31],
+            "comment": sanitize_comment(req.comment)[:31],
             "type_time": mt5.ORDER_TIME_GTC,
         }
         if is_market:
@@ -340,10 +349,17 @@ def cancel_pending(req: CancelPendingRequest, authorization: Optional[str] = Hea
 
     orders = mt5.orders_get() or []
     cancelled = []
+    req_comment = sanitize_comment(req.comment) if req.comment else None
     for o in orders:
-        if req.comment and req.comment not in (o.comment or ""):
-            continue
-        if req.symbol and o.symbol != req.symbol:
+        # Match by sanitized comment (handles Unicode bold → plain ASCII)
+        order_comment = sanitize_comment(o.comment or "")
+        comment_matches = req_comment and req_comment in order_comment
+        # Fallback: match by raw comment for existing orders with corrupted comments
+        raw_comment_matches = req.comment and not comment_matches and req.comment in (o.comment or "")
+        # Fallback: match by symbol if no comment match
+        symbol_matches = req.symbol and o.symbol == req.symbol
+
+        if not comment_matches and not raw_comment_matches and not symbol_matches:
             continue
         remove_order = {
             "action": mt5.TRADE_ACTION_REMOVE,

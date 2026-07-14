@@ -52,7 +52,7 @@ Schema:
 
 Rules:
 - The chart shows XAUUSD (Gold). Always output symbol "XAUUSD" and order_type "limit".
-- Genuine trade signals contain the keywords "BULLISH SETUP" or "BEARISH SETUP" in the image or caption. If neither keyword is present, this is likely a results screenshot or market commentary — set confidence <= 0.3 and action IGNORE.
+- Genuine trade signals contain bullish/bearish directional keywords in the image or caption (e.g. "BULLISH SETUP", "BEARISH SETUP", "VIEW BULLISH", "VIEW BEARISH", "BULLISH", "BEARISH", "BUY SETUP", "SELL SETUP", or any text clearly indicating a trade signal direction). If no directional keyword is present, this is likely a results screenshot or market commentary — set confidence <= 0.3 and action IGNORE.
 - The chart has two adjacent shaded zones separated by a horizontal border line:
   * RED shaded zone = Stop Loss zone. The SL price is at the FAR edge of the red zone (the side opposite the entry border).
   * Grey shaded zone = Trade direction / profit zone. The trade moves in this direction.
@@ -223,7 +223,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     async with httpx.AsyncClient(timeout=30) as c:
         if action in ("BUY", "SELL"):
             # Cancel any pending orders from this channel before placing new one
-            cancel_body = {"comment": ev.channel_title or "signal"}
+            cancel_body = {"comment": ev.channel_title or "signal", "symbol": sig.get("symbol", "XAUUSD")}
             try:
                 cancel_resp = await c.post(f"{BRIDGE_URL}/cancel_pending", json=cancel_body, headers=headers, timeout=10)
                 if cancel_resp.status_code < 400:
