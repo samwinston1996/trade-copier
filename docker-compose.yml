@@ -13,6 +13,9 @@ services:
       - VISION_MODEL=${VISION_MODEL:-google/gemini-3.1-flash-lite-preview}
       - TEXT_MODEL=${TEXT_MODEL:-deepseek/deepseek-v4-flash}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - CHANNEL_STATE_FILE=/data/channel_state.json
+    volumes:
+      - router_data:/data
     networks: [copier]
 
   mt5:
@@ -42,12 +45,17 @@ services:
     env_file: .env
     depends_on: [mt5]
     command: uvicorn bridge:app --host 0.0.0.0 --port 8002
+    environment:
+      - MAX_PER_CHANNEL_TRADES=${MAX_PER_CHANNEL_TRADES:-5}
+      - MAX_GLOBAL_TRADES=${MAX_GLOBAL_TRADES:-25}
 
   listener:
     build: ./listener
     container_name: listener
     restart: unless-stopped
     env_file: .env
+    environment:
+      - IMAGE_CHANNEL_IDS=${IMAGE_CHANNEL_IDS}
     volumes:
       - ./data:/data
     depends_on: [router]
@@ -56,3 +64,6 @@ services:
 networks:
   copier:
     driver: bridge
+
+volumes:
+  router_data:

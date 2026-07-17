@@ -1,14 +1,19 @@
 """
 Signal Router — listener webhook -> LLM parse -> MT5 bridge.
-Two parsing pathways:
-  - TEXT: DeepSeek for text-only signals (buy/sell/close/manage)
-  - IMAGE: Gemini vision for chart screenshots with coloured SL/TP lines
+v3:
+  - Regex pre-filter for known signal formats (Distinct Forex, BotX) — zero LLM cost
+  - Per-channel state machine for reconciliation
+  - /close_channel instead of /cancel_pending (closes positions + cancels orders)
+  - Delete event handler for reverted signals
+  - TP type coercion (float -> list) to prevent Pydantic 422
 """
-import os, json, re, logging
+import os, json, re, logging, time
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
 import httpx
+
+from channel_state import channel_state
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("router")
@@ -23,11 +28,9 @@ ALERT_CHAT_ID = os.environ.get("ALERT_CHAT_ID", "")
 
 TEXT_MODEL = os.environ.get("TEXT_MODEL", "deepseek/deepseek-v4-flash")
 VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-3.1-flash-lite-preview")
-# Only channels listed here process IMAGE signals (chart screenshots).
-# All other channels with images are treated as TEXT (decorative screenshots).
 IMAGE_CHANNEL_IDS = [int(c.strip()) for c in os.environ.get("IMAGE_CHANNEL_IDS", "").split(",") if c.strip()]
 
-# ── Two distinct prompts ──────────────────────────────────────────
+# ── Prompts ─────────────────────────────────────────────────────
 
 TEXT_SYSTEM_PROMPT = """You are a trade-signal parser. Input: a raw Telegram message from a signals channel.
 Output: ONLY a single JSON object, no prose, no markdown fences.
@@ -59,8 +62,8 @@ Rules:
 - The ENTRY price is the horizontal border line between the RED zone and the Grey zone.
 - Take Profit (TP): The far boundary line of the Grey zone. Output only ONE TP price.
 - Determine direction:
-  * If RED zone is ABOVE and Grey zone is BELOW the entry → action = SELL
-  * If Grey zone is ABOVE and RED zone is BELOW the entry → action = BUY
+  * If RED zone is ABOVE and Grey zone is BELOW the entry -> action = SELL
+  * If Grey zone is ABOVE and RED zone is BELOW the entry -> action = BUY
 - Read the exact price labels on the Y-axis for entry, SL, and TP levels.
 - For accuracy: the right panel shows boxed price indicators.
   - SL price = the RED box in the right panel, horizontally aligned with the far edge of the RED zone
@@ -84,7 +87,7 @@ class ListenerEvent(BaseModel):
     reply_to_id: Optional[int] = None
     text: str = ""
     has_media: bool = False
-    image_data: Optional[str] = None   # base64-encoded image from listener
+    image_data: Optional[str] = None
     date: str
 
 
@@ -107,7 +110,53 @@ def extract_json(s: str) -> dict:
     return json.loads(m.group(0))
 
 
-# ── TEXT parser (DeepSeek) ────────────────────────────────────────
+# ── Regex pre-filter for known text formats ─────────────────────
+
+def parse_with_regex(text: str) -> dict | None:
+    """Try to parse known text signal formats with regex.
+    Returns None if no match — caller should fall back to LLM.
+    """
+    # Guard: result/recap messages contain hit/profit keywords — let LLM handle
+    if re.search(r'(HIT|✅|❌|😄|💯|PROFIT)', text):
+        return None
+
+    # — Distinct Forex format: #XAUUSD BUY 4000 \n\n TP 4004 \n TP 4008 ... \n\n SL 3990 —
+    m = re.search(r'#?XAUUSD\s+(BUY|SELL)\s+(\d+\.?\d*)', text)
+    if m:
+        action = m.group(1)
+        entry = float(m.group(2))
+        tps = [float(x) for x in re.findall(r'TP\s+(\d+\.?\d*)', text)]
+        sl_m = re.search(r'SL\s+(\d+\.?\d*)', text)
+        sl = float(sl_m.group(1)) if sl_m else None
+        if sl and tps:
+            return {
+                "action": action, "symbol": "XAUUSD",
+                "order_type": "limit", "entry": entry,
+                "sl": sl, "tp": tps, "confidence": 1.0,
+            }
+        return {"action": action, "confidence": 0.3}
+
+    # — BotX format: BUY XAUUSD \n ENTRY: 4120 \n SL: 4110 \n TP: 4137 —
+    m = re.search(r'(BUY|SELL)\s+XAUUSD', text)
+    if m:
+        action = m.group(1)
+        entry_m = re.search(r'ENTRY:\s*(\d+\.?\d*)', text)
+        sl_m = re.search(r'SL:\s*(\d+\.?\d*)', text)
+        tps = [float(x) for x in re.findall(r'TP\d?:?\s*(\d+\.?\d*)', text)]
+        entry = float(entry_m.group(1)) if entry_m else None
+        sl = float(sl_m.group(1)) if sl_m else None
+        if entry and sl and tps:
+            return {
+                "action": action, "symbol": "XAUUSD",
+                "order_type": "limit", "entry": entry,
+                "sl": sl, "tp": tps, "confidence": 1.0,
+            }
+        return {"action": action, "confidence": 0.3}
+
+    return None
+
+
+# ── LLM parsers ────────────────────────────────────────────────
 
 async def parse_text_signal(text: str) -> dict:
     payload = {
@@ -125,10 +174,7 @@ async def parse_text_signal(text: str) -> dict:
         return extract_json(r.json()["choices"][0]["message"]["content"])
 
 
-# ── IMAGE parser (Gemini vision) ──────────────────────────────────
-
 async def parse_image_signal(image_b64: str, caption: str = "") -> dict:
-    """Parse a chart image trade signal via Gemini vision model."""
     user_text = caption.strip() if caption.strip() else "Read the chart levels and extract the trade signal."
     payload = {
         "model": VISION_MODEL,
@@ -154,7 +200,7 @@ async def parse_image_signal(image_b64: str, caption: str = "") -> dict:
         return extract_json(r.json()["choices"][0]["message"]["content"])
 
 
-# ── Endpoints ─────────────────────────────────────────────────────
+# ── Endpoints ───────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -166,32 +212,60 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if authorization != f"Bearer {WEBHOOK_TOKEN}":
         raise HTTPException(401, "bad token")
 
-    # Route to the right parser based on channel type and content
+    # ===== 1. DELETE EVENT — revert channel state, clean up MT5 =====
+    if ev.event == "delete":
+        log.info("Delete event: channel=%s msg=%s", ev.channel_id, ev.message_id)
+        removed = channel_state.remove_signal_id(str(ev.channel_id), ev.message_id)
+        if removed:
+            title = channel_state.get_channel_title(str(ev.channel_id))
+            comment = title or str(ev.channel_id)
+            headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+            async with httpx.AsyncClient(timeout=15) as c:
+                await c.post(
+                    f"{BRIDGE_URL}/close_channel",
+                    json={"comment": comment},
+                    headers=headers,
+                )
+            log.info("Cleaned up MT5 for channel %s after signal deletion", ev.channel_id)
+        return {"status": "delete_processed"}
+
+    # ===== 2. ROUTE TO PARSER =====
     is_image = False
     has_image = ev.image_data and len(ev.image_data) > 100
     is_image_channel = ev.channel_id in IMAGE_CHANNEL_IDS
 
     if has_image and is_image_channel:
         is_image = True
-        log.info("Routing msg %s to VISION parser (image channel, %s b64 chars)", ev.message_id, len(ev.image_data))
+        log.info("Routing msg %s to VISION parser (image channel, %s b64 chars)",
+                 ev.message_id, len(ev.image_data))
         try:
             sig = await parse_image_signal(ev.image_data, ev.text)
         except Exception as e:
             await alert(f"Image parse failed for {ev.channel_id}:{ev.message_id}\n{e}")
             raise HTTPException(502, f"image parse failed: {e}")
+
     elif ev.text.strip():
         if has_image and not is_image_channel:
-            log.info("Channel %s has image but not in IMAGE_CHANNEL_IDS — routing to TEXT parser", ev.channel_id)
+            log.info("Channel %s has image but not in IMAGE_CHANNEL_IDS — routing to TEXT parser",
+                     ev.channel_id)
         log.info("Routing msg %s to TEXT parser", ev.message_id)
-        try:
-            sig = await parse_text_signal(ev.text)
-        except Exception as e:
-            await alert(f"Text parse failed for {ev.channel_id}:{ev.message_id}\n{e}")
-            raise HTTPException(502, f"parse failed: {e}")
+
+        # Try regex pre-filter first (zero LLM cost)
+        sig = parse_with_regex(ev.text)
+        if sig:
+            log.info("Regex parsed %s:%s -> %s conf=%.2f",
+                     ev.channel_id, ev.message_id, sig.get("action", "?"), sig.get("confidence", 0))
+        else:
+            try:
+                sig = await parse_text_signal(ev.text)
+            except Exception as e:
+                await alert(f"Text parse failed for {ev.channel_id}:{ev.message_id}\n{e}")
+                raise HTTPException(502, f"parse failed: {e}")
+
     else:
         return {"status": "ignored", "reason": "empty message — no text or image"}
 
-    # Process parsed result
+    # ===== 3. PROCESS PARSED RESULT =====
     action = sig.get("action", "IGNORE").upper()
     conf = float(sig.get("confidence", 0))
     log.info("parsed %s:%s -> %s conf=%.2f", ev.channel_id, ev.message_id, action, conf)
@@ -199,7 +273,6 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if action == "IGNORE":
         return {"status": "ignored", "signal": sig}
 
-    # Guard: reject BUY/SELL with missing SL or low confidence
     if action in ("BUY", "SELL"):
         if sig.get("sl") is None:
             log.warning("Rejected %s:%s — SL missing, conf=%.2f", ev.channel_id, ev.message_id, conf)
@@ -208,30 +281,40 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             log.warning("Rejected %s:%s — confidence %.2f below 0.5", ev.channel_id, ev.message_id, conf)
             return {"status": "ignored", "reason": f"confidence {conf:.2f} below 0.5"}
 
-    # Guard: image signals must have SL at least 50 pips from entry
     if is_image and action in ("BUY", "SELL"):
         symbol = sig.get("symbol", "XAUUSD")
         pip_sizes = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
         pip_size = pip_sizes.get(symbol, 0.10)
         sl_distance = abs(sig["entry"] - sig["sl"]) / pip_size
         if sl_distance < 50:
-            log.warning("Rejected image signal %s:%s — SL only %.0f pips from entry (min 50)", ev.channel_id, ev.message_id, sl_distance)
+            log.warning("Rejected image signal %s:%s — SL only %.0f pips from entry (min 50)",
+                        ev.channel_id, ev.message_id, sl_distance)
             await alert(f"Trade.inn signal rejected: SL too tight ({sl_distance:.0f} pips, min 50)")
             return {"status": "ignored", "reason": f"SL too tight: {sl_distance:.0f} pips (min 50)"}
 
+    # ===== 4. FORWARD TO BRIDGE =====
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
     async with httpx.AsyncClient(timeout=30) as c:
         if action in ("BUY", "SELL"):
-            # Cancel any pending orders from this channel before placing new one
-            cancel_body = {"comment": ev.channel_title or "signal", "symbol": sig.get("symbol", "XAUUSD")}
+            # --- a) Close existing positions + cancel pending orders for this channel ---
+            close_body = {"comment": ev.channel_title or "signal"}
             try:
-                cancel_resp = await c.post(f"{BRIDGE_URL}/cancel_pending", json=cancel_body, headers=headers, timeout=10)
-                if cancel_resp.status_code < 400:
-                    cancelled = cancel_resp.json().get("cancelled", [])
-                    if cancelled:
-                        log.info("Cancelled %d pending orders for channel '%s' before new signal", len(cancelled), ev.channel_title)
+                close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
+                                          headers=headers, timeout=15)
+                if close_resp.status_code < 400:
+                    result = close_resp.json()
+                    closed = result.get("closed", [])
+                    cancelled = result.get("cancelled", [])
+                    if closed or cancelled:
+                        log.info("Closed %d positions + cancelled %d orders for '%s' before new signal",
+                                 len(closed), len(cancelled), ev.channel_title)
             except Exception as e:
-                log.warning("cancel_pending call failed (non-fatal): %s", e)
+                log.warning("close_channel call failed (non-fatal): %s", e)
+
+            # --- b) Build trade body with TP coercion ---
+            raw_tp = sig.get("tp")
+            if isinstance(raw_tp, (int, float)):
+                raw_tp = [raw_tp]
 
             body = {
                 "action": action,
@@ -239,21 +322,25 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 "order_type": sig.get("order_type", "market"),
                 "entry": sig.get("entry"),
                 "sl": sig.get("sl"),
-                "tp": sig.get("tp") or [],
+                "tp": raw_tp or [],
                 "signal_id": f"{ev.channel_title or ev.channel_id}:{ev.message_id}",
                 "comment": ev.channel_title or "signal",
                 "from_image": is_image,
             }
+
             if is_image and body["entry"] is not None:
-                # Add 100-pip TP in trade direction as TP1 (closer target)
-                hundred_pips = 10.0  # 100 pips × 0.10 for XAUUSD
+                hundred_pips = 10.0
                 extra_tp = body["entry"] - hundred_pips if action == "SELL" else body["entry"] + hundred_pips
                 body["tp"] = [round(extra_tp, 2)] + (body["tp"] or [])
                 log.info("Added 100-pip TP at %.2f for image signal", extra_tp)
+
             if body["entry"] is not None and body["order_type"] == "market" and not is_image:
                 body["order_type"] = "limit"
                 log.info("entry=%.2f specified — converting market->limit", body["entry"])
+
+            # --- c) Send trade ---
             r = await c.post(f"{BRIDGE_URL}/trade", json=body, headers=headers)
+
         else:
             ref = ev.reply_to_id or ev.message_id
             body = {
@@ -263,8 +350,22 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             }
             r = await c.post(f"{BRIDGE_URL}/manage", json=body, headers=headers)
 
+    # ===== 5. ALERT + STATE UPDATE =====
     if r.status_code >= 400:
         await alert(f"Bridge rejected {ev.channel_id}:{ev.message_id}: {r.status_code} {r.text[:300]}")
     else:
         await alert(f"Executed {action} {sig.get('symbol', '')}: {r.text[:300]}")
+        if action in ("BUY", "SELL"):
+            channel_state.update(str(ev.channel_id), {
+                "msg_id": ev.message_id,
+                "channel_title": ev.channel_title or str(ev.channel_id),
+                "action": action,
+                "entry": sig.get("entry"),
+                "sl": sig.get("sl"),
+                "tp": sig.get("tp", []),
+                "order_type": sig.get("order_type", "market"),
+                "from_image": is_image,
+                "timestamp": ev.date,
+            })
+
     return {"status": "forwarded", "bridge_status": r.status_code, "bridge_body": r.json()}

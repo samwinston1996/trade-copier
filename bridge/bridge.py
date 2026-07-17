@@ -1,17 +1,17 @@
 """
 MT5 Bridge — the ONLY component that places trades.
-Endpoints:
-  GET  /health   -> is MT5 connected to the broker?
-  POST /trade    -> open a position (with risk gates + lot sizing)
-  POST /manage   -> close/partial-close/move-SL on an existing position
-
-Risk gates are deterministic Python. Hermes/the LLM cannot bypass them.
+v3:
+  - Atomic executed_signals lock (prevents duplicate race condition)
+  - /close_channel endpoint (close positions + cancel pending per channel)
+  - Robust rpyc iteration with EOFError retry (iterate_safe)
+  - Per-channel + global trade limits
 """
 import os
 import time
 import logging
 import unicodedata
-from datetime import datetime, timezone, timedelta
+import threading
+from datetime import datetime, timezone
 from typing import Optional, List, Literal
 
 from fastapi import FastAPI, HTTPException, Header
@@ -24,11 +24,11 @@ log = logging.getLogger("bridge")
 BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 RISK_PERCENT = float(os.environ.get("RISK_PERCENT", 1.0))
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PERCENT", 4.0))
-MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES", 5))
+MAX_GLOBAL_TRADES = int(os.environ.get("MAX_GLOBAL_TRADES", 25))
+MAX_PER_CHANNEL = int(os.environ.get("MAX_PER_CHANNEL_TRADES", 5))
 MAGIC = 777001
 
 SYMBOL_MAP = {"GOLD": "XAUUSD", "XAU": "XAUUSD", "DOW": "US30", "NAS": "NAS100"}
-# Pip size per symbol (point * pip_multiplier). XAUUSD=0.10, US30/NAS100=1.0
 PIP_SIZES = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
 
 
@@ -40,9 +40,9 @@ def sanitize_comment(comment: str) -> str:
 
 
 app = FastAPI(title="MT5 Bridge")
-executed_signals: set[str] = set()
 
-_mt5 = None
+executed_signals: set[str] = set()
+executed_lock = threading.Lock()
 
 
 class TradeRequest(BaseModel):
@@ -64,33 +64,28 @@ class ManageRequest(BaseModel):
     value: Optional[float] = None
 
 
-class CancelPendingRequest(BaseModel):
+class CloseChannelRequest(BaseModel):
     comment: Optional[str] = None
     symbol: Optional[str] = None
 
 
-def auth(authorization: Optional[str]):
+def auth(authorization: str = Header(None)):
     if authorization != f"Bearer {BRIDGE_TOKEN}":
         raise HTTPException(401, "bad token")
 
 
 def get_mt5(retries: int = 30, delay: int = 2):
-    """
-    Create a fresh MT5 connection. No caching — each call gets a new client.
-    """
     last_err = None
     for attempt in range(1, retries + 1):
         try:
             client = MetaTrader5(host="localhost", port=8001)
-            _mt5 = client
-            log.info("Connected to mt5linux on localhost:8001 (attempt %s/%s)", attempt, retries)
-            return _mt5
+            log.info("Connected to mt5linux (attempt %s/%s)", attempt, retries)
+            return client
         except Exception as e:
             last_err = e
             log.warning("MT5 RPC not ready yet (attempt %s/%s): %s", attempt, retries, e)
             time.sleep(delay)
-
-    raise HTTPException(503, f"MT5 RPC unavailable on localhost:8001 after retries: {last_err}")
+    raise HTTPException(503, f"MT5 RPC unavailable: {last_err}")
 
 
 def ensure_mt5():
@@ -104,6 +99,32 @@ def ensure_mt5():
     return mt5
 
 
+# ── Safe rpyc iterator (handles EOFError on stale proxy objects) ─
+def iterate_safe(mt5_collection, max_retries=3):
+    """Safely iterate rpyc proxy objects, retrying on EOFError."""
+    result = []
+    for attempt in range(1, max_retries + 1):
+        try:
+            items = list(mt5_collection) if mt5_collection else []
+        except (EOFError, OSError, AttributeError) as e:
+            log.warning("MT5 collection error: %s — retry %d/%d", e, attempt, max_retries)
+            time.sleep(1)
+            continue
+        result = []
+        for item in items:
+            try:
+                _ = item.ticket  # force RPC attribute access
+                result.append(item)
+            except (EOFError, AttributeError) as e:
+                log.warning("MT5 item error: %s — retry %d/%d", e, attempt, max_retries)
+                time.sleep(1)
+                break
+        else:
+            return result
+    log.warning("Exhausted retries — returning %d items", len(result))
+    return result
+
+
 def daily_loss_exceeded(mt5_client=None) -> bool:
     mt5 = mt5_client if mt5_client else get_mt5()
     acct = mt5.account_info()
@@ -114,8 +135,8 @@ def daily_loss_exceeded(mt5_client=None) -> bool:
     deals = mt5.history_deals_get(sod_ts, now_ts) or []
     return sum(d.profit for d in deals) < -(acct.balance * MAX_DAILY_LOSS_PCT / 100)
 
+
 def calc_lot(symbol: str, entry: float, sl: float, risk_pct: float, mt5_client=None) -> float:
-    """Step-based lot sizing: balance/100 → lots, min 0.01."""
     mt5 = mt5_client if mt5_client else get_mt5()
     acct = mt5.account_info()
     info = mt5.symbol_info(symbol)
@@ -124,6 +145,8 @@ def calc_lot(symbol: str, entry: float, sl: float, risk_pct: float, mt5_client=N
     lot = max(info.volume_min, min(info.volume_max, round(lot / info.volume_step) * info.volume_step))
     return round(lot, 2)
 
+
+# ── Endpoints ───────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -144,242 +167,271 @@ def health():
         return {"mt5_connected": False, "error": str(e)}
 
 
+@app.post("/close_channel")
+def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
+    """Close ALL open positions + cancel ALL pending orders matching a channel comment."""
+    auth(authorization)
+
+    if not req.comment:
+        raise HTTPException(400, "comment is required — refusing to close all positions")
+
+    mt5 = ensure_mt5()
+    comment = sanitize_comment(req.comment)
+    closed = []
+    cancelled = []
+
+    # Close all open positions from this channel (safe iteration)
+    for p in iterate_safe(mt5.positions_get()):
+        if comment not in sanitize_comment(p.comment or ""):
+            continue
+        tick = mt5.symbol_info_tick(p.symbol)
+        close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        close_price = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
+        res = mt5.order_send({
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": p.symbol,
+            "volume": p.volume,
+            "position": p.ticket,
+            "type": close_type,
+            "price": close_price,
+            "deviation": 20,
+            "magic": MAGIC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        })
+        rc = res.retcode if res else -1
+        closed.append({"ticket": p.ticket, "symbol": p.symbol, "retcode": rc})
+        log.info("Closed position %s %s -> retcode=%s", p.ticket, p.symbol, rc)
+
+    # Cancel all pending orders from this channel (safe iteration)
+    import subprocess, json as _json
+    for o in iterate_safe(mt5.orders_get()):
+        if comment not in sanitize_comment(o.comment or ""):
+            continue
+        remove_order = {"action": 3, "order": o.ticket, "symbol": o.symbol}
+        sp = subprocess.run(
+            ["python3", "/app/order_send.py", _json.dumps(remove_order),
+             os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
+            capture_output=True, text=True, timeout=15)
+        out = sp.stdout.strip()
+        rc = int(out.split(":")[1]) if out.startswith("OK:") else -1
+        if not out.startswith("OK:"):
+            log.error("cancel_pending subprocess failed: %s", sp.stderr[:200])
+        cancelled.append({"ticket": o.ticket, "symbol": o.symbol, "retcode": rc})
+        log.info("Cancelled pending order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
+
+    return {"status": "done", "closed": closed, "cancelled": cancelled}
+
+
+@app.post("/cancel_pending")
+def cancel_pending(req: CloseChannelRequest, authorization: str = Header(None)):
+    """Legacy endpoint — delegates to close_channel."""
+    return close_channel(req, authorization)
+
+
 @app.post("/trade")
 def trade(req: TradeRequest, authorization: str = Header(None)):
     auth(authorization)
     mt5 = ensure_mt5()
 
-    if req.signal_id in executed_signals:
-        return {"status": "duplicate_ignored"}
+    # Atomic duplicate detection (burn on check, un-burn on failure)
+    with executed_lock:
+        if req.signal_id in executed_signals:
+            return {"status": "duplicate_ignored"}
+        executed_signals.add(req.signal_id)
 
-    if not req.tp or all(t == 0 for t in req.tp):
-        raise HTTPException(400, "TP is required — every trade needs a take profit")
+    try:
+        # --- Validation ---
+        if not req.tp or all(t == 0 for t in req.tp):
+            raise HTTPException(400, "TP is required — every trade needs a take profit")
+        if req.sl is None or req.sl == 0:
+            raise HTTPException(400, "SL is required — every trade needs a stop loss")
 
-    if req.sl is None or req.sl == 0:
-        raise HTTPException(400, "SL is required — every trade needs a stop loss")
+        # Global trade cap (safety net)
+        if len(iterate_safe(mt5.positions_get())) >= MAX_GLOBAL_TRADES:
+            raise HTTPException(429, "max global trades reached")
 
-    if daily_loss_exceeded(mt5_client=mt5):
-        raise HTTPException(423, "DAILY LOSS CAP HIT — trading disabled today")
+        # Per-channel trade cap
+        comment = sanitize_comment(req.comment)
+        channel_positions = [
+            p for p in iterate_safe(mt5.positions_get())
+            if comment in sanitize_comment(p.comment or "")
+        ]
+        if len(channel_positions) >= MAX_PER_CHANNEL:
+            raise HTTPException(429, f"max {MAX_PER_CHANNEL} trades reached for channel '{req.comment}'")
 
-    if len(mt5.positions_get() or []) >= MAX_OPEN_TRADES:
-        raise HTTPException(429, "max open trades reached")
+        if daily_loss_exceeded(mt5_client=mt5):
+            raise HTTPException(423, "DAILY LOSS CAP HIT — trading disabled today")
 
-    symbol = SYMBOL_MAP.get(req.symbol.upper(), req.symbol.upper())
-    if not mt5.symbol_select(symbol, True):
-        raise HTTPException(400, f"unknown symbol {symbol}")
+        symbol = SYMBOL_MAP.get(req.symbol.upper(), req.symbol.upper())
+        if not mt5.symbol_select(symbol, True):
+            raise HTTPException(400, f"unknown symbol {symbol}")
 
-    tick = mt5.symbol_info_tick(symbol)
-    price = tick.ask if req.action == "BUY" else tick.bid
-    entry = req.entry if req.order_type != "market" else price
+        # --- 20-pip rule (bridge decides) ---
+        tick = mt5.symbol_info_tick(symbol)
+        price = tick.ask if req.action == "BUY" else tick.bid
+        entry = req.entry if req.order_type != "market" else price
+        pip_size = PIP_SIZES.get(symbol, mt5.symbol_info(symbol).point * 10)
+        twenty_pips = 20 * pip_size
+        final_type = req.order_type
 
-    # 20-pip rule: bridge decides market vs limit, overriding router's conversion
-    pip_size = PIP_SIZES.get(symbol, mt5.symbol_info(symbol).point * 10)
-    twenty_pips = 20 * pip_size
-    final_type = req.order_type
-    if req.entry is not None:
-        if abs(req.entry - price) >= twenty_pips:
-            entry = req.entry
-            # BUY: entry below market → LIMIT, above → STOP
-            # SELL: entry above market → LIMIT, below → STOP
-            if (req.action == "BUY" and req.entry < price) or (req.action == "SELL" and req.entry > price):
-                final_type = "limit"
-                log.info("entry=%.2f is %.1f pips from market=%.2f — LIMIT at %.2f",
-                         req.entry, abs(req.entry - price) / pip_size, price, entry)
-            else:
-                final_type = "stop"
-                log.info("entry=%.2f is %.1f pips from market=%.2f — STOP at %.2f",
-                         req.entry, abs(req.entry - price) / pip_size, price, entry)
-        else:
-            if req.from_image:
-                # Image signals: keep as pending order even if <20 pips from market
+        if req.entry is not None:
+            if abs(req.entry - price) >= twenty_pips:
                 entry = req.entry
                 if (req.action == "BUY" and req.entry < price) or (req.action == "SELL" and req.entry > price):
                     final_type = "limit"
-                    log.info("entry=%.2f is %.1f pips from market=%.2f — IMAGE LIMIT at %.2f",
+                    log.info("entry=%.2f is %.1f pips from market=%.2f — LIMIT at %.2f",
                              req.entry, abs(req.entry - price) / pip_size, price, entry)
                 else:
                     final_type = "stop"
-                    log.info("entry=%.2f is %.1f pips from market=%.2f — IMAGE STOP at %.2f",
+                    log.info("entry=%.2f is %.1f pips from market=%.2f — STOP at %.2f",
                              req.entry, abs(req.entry - price) / pip_size, price, entry)
             else:
-                final_type = "market"
-                entry = price
-                log.info("entry=%.2f is <20 pips from market=%.2f — MARKET at %.2f",
-                         req.entry, price, price)
+                if req.from_image:
+                    entry = req.entry
+                    if (req.action == "BUY" and req.entry < price) or (req.action == "SELL" and req.entry > price):
+                        final_type = "limit"
+                        log.info("entry=%.2f is %.1f pips from market=%.2f — IMAGE LIMIT at %.2f",
+                                 req.entry, abs(req.entry - price) / pip_size, price, entry)
+                    else:
+                        final_type = "stop"
+                        log.info("entry=%.2f is %.1f pips from market=%.2f — IMAGE STOP at %.2f",
+                                 req.entry, abs(req.entry - price) / pip_size, price, entry)
+                else:
+                    final_type = "market"
+                    entry = price
+                    log.info("entry=%.2f is <20 pips from market=%.2f — MARKET at %.2f",
+                             req.entry, price, price)
 
-    if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
-        raise HTTPException(400, "SL on wrong side of entry — bad parse or bad signal")
+        # --- SL direction check ---
+        if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
+            raise HTTPException(400, "SL on wrong side of entry — bad parse or bad signal")
 
-    if req.order_type == "market" and req.entry and abs(price - req.entry) / price > 0.005:
-        raise HTTPException(400, "market moved >0.5% since signal — rejected (stale)")
+        # --- Stale signal check ---
+        if req.order_type == "market" and req.entry and abs(price - req.entry) / price > 0.005:
+            raise HTTPException(400, "market moved >0.5% since signal — rejected (stale)")
 
-    lot = calc_lot(symbol, entry, req.sl, req.risk_percent or RISK_PERCENT, mt5_client=mt5)
+        # --- Lot sizing ---
+        lot = calc_lot(symbol, entry, req.sl, req.risk_percent or RISK_PERCENT, mt5_client=mt5)
 
-    tmap = {
-        ("BUY", "market"): mt5.ORDER_TYPE_BUY,
-        ("SELL", "market"): mt5.ORDER_TYPE_SELL,
-        ("BUY", "limit"): mt5.ORDER_TYPE_BUY_LIMIT,
-        ("SELL", "limit"): mt5.ORDER_TYPE_SELL_LIMIT,
-        ("BUY", "stop"): mt5.ORDER_TYPE_BUY_STOP,
-        ("SELL", "stop"): mt5.ORDER_TYPE_SELL_STOP,
-    }
-
-    is_market = final_type == "market"
-    tps = req.tp or [0.0]
-    lot_each = round(max(mt5.symbol_info(symbol).volume_min, lot / len(tps)), 2)
-
-    results = []
-    for tp in tps:
-        order = {
-            "action": mt5.TRADE_ACTION_DEAL if is_market else mt5.TRADE_ACTION_PENDING,
-            "symbol": symbol,
-            "volume": lot_each,
-            "type": tmap[(req.action, final_type)],
-            "price": price if is_market else entry,
-            "sl": req.sl,
-            "tp": tp,
-            "deviation": 20,
-            "magic": MAGIC,
-            "comment": sanitize_comment(req.comment)[:31],
-            "type_time": mt5.ORDER_TIME_GTC,
+        # --- Order execution ---
+        tmap = {
+            ("BUY", "market"): mt5.ORDER_TYPE_BUY,
+            ("SELL", "market"): mt5.ORDER_TYPE_SELL,
+            ("BUY", "limit"): mt5.ORDER_TYPE_BUY_LIMIT,
+            ("SELL", "limit"): mt5.ORDER_TYPE_SELL_LIMIT,
+            ("BUY", "stop"): mt5.ORDER_TYPE_BUY_STOP,
+            ("SELL", "stop"): mt5.ORDER_TYPE_SELL_STOP,
         }
-        if is_market:
-            order["type_filling"] = mt5.ORDER_FILLING_FOK
 
-        log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s",
+        is_market = final_type == "market"
+        tps = req.tp or [0.0]
+        lot_each = round(max(mt5.symbol_info(symbol).volume_min, lot / len(tps)), 2)
+
+        results = []
+        for tp in tps:
+            order = {
+                "action": mt5.TRADE_ACTION_DEAL if is_market else mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": lot_each,
+                "type": tmap[(req.action, final_type)],
+                "price": price if is_market else entry,
+                "sl": req.sl,
+                "tp": tp,
+                "deviation": 20,
+                "magic": MAGIC,
+                "comment": sanitize_comment(req.comment)[:31],
+                "type_time": mt5.ORDER_TIME_GTC,
+            }
+            if is_market:
+                order["type_filling"] = mt5.ORDER_FILLING_FOK
+
+            log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s",
                      order.get("action"), order.get("type"), order.get("symbol"),
                      order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
-        import subprocess, json as _json
-        order_json = _json.dumps(order)
-        sp = subprocess.run(
-            ["python3", "/app/order_send.py", order_json,
-             os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
-            capture_output=True, text=True, timeout=30)
-        out = sp.stdout.strip()
-        log.info("order_send subprocess: %s", out)
-        if out.startswith("OK:"):
-            parts = out.split(":")
-            res = type("obj", (), {"retcode": int(parts[1]), "order": int(parts[2])})()
-        else:
-            log.error("order_send subprocess failed: %s", sp.stderr[:300])
-            res = None
-        if res is None:
-            log.error("order_send returned None — order=%s", order)
-            log.warning("order_send returned None for %s %s lot=%s tp=%s — reconnecting MT5", req.action, symbol, lot_each, tp)
-            _mt5 = None  # Force reconnection
-            mt5 = ensure_mt5()
-            time.sleep(1.0)
-            log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s (fallback after subprocess None)",
-                     order.get("action"), order.get("type"), order.get("symbol"),
-                     order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
-            res = mt5.order_send(order)
-        if res is None:
-            log.error("order_send returned None — order=%s", order)
-            log.error("order_send returned None again after reconnect for %s %s — aborting", req.action, symbol)
-            results.append({"retcode": -1, "order": 0, "tp": tp, "error": "MT5 RPC returned None"})
-            continue
-        if res.retcode == mt5.TRADE_RETCODE_REQUOTE:
-            time.sleep(0.5)
-            res = mt5.order_send(order)
 
-        results.append({"retcode": res.retcode, "order": res.order, "tp": tp})
-        log.info("%s %s lot=%s tp=%s -> retcode=%s", req.action, symbol, lot_each, tp, res.retcode)
+            import subprocess, json as _json
+            order_json = _json.dumps(order)
+            sp = subprocess.run(
+                ["python3", "/app/order_send.py", order_json,
+                 os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
+                capture_output=True, text=True, timeout=30)
+            out = sp.stdout.strip()
+            log.info("order_send subprocess: %s", out)
 
-    if all(r["retcode"] == mt5.TRADE_RETCODE_DONE for r in results):
-        executed_signals.add(req.signal_id)
-        return {"status": "executed", "symbol": symbol, "lot_each": lot_each, "orders": results}
+            if out.startswith("OK:"):
+                parts = out.split(":")
+                res = type("obj", (), {"retcode": int(parts[1]), "order": int(parts[2])})()
+            else:
+                log.error("order_send subprocess failed: %s", sp.stderr[:300])
+                res = None
 
-    raise HTTPException(500, f"partial/failed execution: {results}")
+            if res is None:
+                log.error("order_send returned None — order=%s", order)
+                log.warning("order_send returned None for %s %s lot=%s tp=%s — reconnecting MT5",
+                            req.action, symbol, lot_each, tp)
+                mt5 = ensure_mt5()
+                time.sleep(1.0)
+                log.info("Sending order to MT5: action=%s type=%s symbol=%s vol=%s price=%s sl=%s tp=%s (fallback after subprocess None)",
+                         order.get("action"), order.get("type"), order.get("symbol"),
+                         order.get("volume"), order.get("price"), order.get("sl"), order.get("tp"))
+                res = mt5.order_send(order)
+
+            if res is None:
+                log.error("order_send returned None again after reconnect for %s %s — aborting", req.action, symbol)
+                results.append({"retcode": -1, "order": 0, "tp": tp, "error": "MT5 RPC returned None"})
+                continue
+
+            if res.retcode == mt5.TRADE_RETCODE_REQUOTE:
+                time.sleep(0.5)
+                res = mt5.order_send(order)
+
+            results.append({"retcode": res.retcode, "order": res.order, "tp": tp})
+            log.info("%s %s lot=%s tp=%s -> retcode=%s", req.action, symbol, lot_each, tp, res.retcode)
+
+        # --- Result ---
+        if all(r["retcode"] == mt5.TRADE_RETCODE_DONE for r in results):
+            return {"status": "executed", "symbol": symbol, "lot_each": lot_each, "orders": results}
+
+        raise HTTPException(500, f"partial/failed execution: {results}")
+
+    except Exception:
+        # On failure, free the signal_id so it can be retried
+        with executed_lock:
+            executed_signals.discard(req.signal_id)
+        raise
 
 
 @app.post("/manage")
 def manage(req: ManageRequest, authorization: str = Header(None)):
     auth(authorization)
     mt5 = ensure_mt5()
-
     matched = [p for p in (mt5.positions_get() or []) if req.signal_id in p.comment]
     if not matched:
         raise HTTPException(404, "no open position for that signal_id")
-
     out = []
     for p in matched:
         if req.op in ("close_all", "close_partial"):
             vol = p.volume if req.op == "close_all" else round(p.volume * (req.value or 50) / 100, 2)
             tick = mt5.symbol_info_tick(p.symbol)
-            res = mt5.order_send(
-                {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "symbol": p.symbol,
-                    "volume": vol,
-                    "position": p.ticket,
-                    "type": mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
-                    "price": tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask,
-                    "deviation": 20,
-                    "magic": MAGIC,
-                    "type_filling": mt5.ORDER_FILLING_FOK,
-                }
-            )
+            res = mt5.order_send({
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": p.symbol,
+                "volume": vol,
+                "position": p.ticket,
+                "type": mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "price": tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask,
+                "deviation": 20,
+                "magic": MAGIC,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+            })
         else:
             new_sl = p.price_open if req.op == "sl_to_be" else req.value
-            res = mt5.order_send(
-                {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": p.ticket,
-                    "symbol": p.symbol,
-                    "sl": new_sl,
-                    "tp": p.tp,
-                }
-            )
-
+            res = mt5.order_send({
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": p.ticket,
+                "symbol": p.symbol,
+                "sl": new_sl,
+                "tp": p.tp,
+            })
         out.append({"ticket": p.ticket, "retcode": res.retcode})
-
     return {"status": "done", "results": out}
-
-
-@app.post("/cancel_pending")
-def cancel_pending(req: CancelPendingRequest, authorization: Optional[str] = Header(None)):
-    auth(authorization)
-    mt5 = get_mt5()
-    if not mt5.initialize(
-        login=int(os.environ["MT5_LOGIN"]),
-        password=os.environ["MT5_PASSWORD"],
-        server=os.environ["MT5_SERVER"],
-    ):
-        raise HTTPException(503, f"MT5 init failed: {mt5.last_error()}")
-
-    orders = mt5.orders_get() or []
-    cancelled = []
-    req_comment = sanitize_comment(req.comment) if req.comment else None
-    for o in orders:
-        # Match by sanitized comment (handles Unicode bold → plain ASCII)
-        order_comment = sanitize_comment(o.comment or "")
-        comment_matches = req_comment and req_comment in order_comment
-        # Fallback: match by raw comment for existing orders with corrupted comments
-        raw_comment_matches = req.comment and not comment_matches and req.comment in (o.comment or "")
-        # Fallback: match by symbol if no comment match
-        symbol_matches = req.symbol and o.symbol == req.symbol
-
-        if not comment_matches and not raw_comment_matches and not symbol_matches:
-            continue
-        remove_order = {
-            "action": mt5.TRADE_ACTION_REMOVE,
-            "order": o.ticket,
-            "symbol": o.symbol,
-        }
-        import subprocess, json as _json
-        order_json = _json.dumps(remove_order)
-        sp = subprocess.run(
-            ["python3", "/app/order_send.py", order_json,
-             os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
-            capture_output=True, text=True, timeout=15)
-        out = sp.stdout.strip()
-        if out.startswith("OK:"):
-            parts = out.split(":")
-            rc = int(parts[1])
-        else:
-            log.error("cancel_pending subprocess failed: %s", sp.stderr[:200])
-            rc = -1
-        cancelled.append({"ticket": o.ticket, "symbol": o.symbol, "retcode": rc})
-        log.info("Cancelled pending order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
-
-    return {"status": "done", "cancelled": cancelled}
