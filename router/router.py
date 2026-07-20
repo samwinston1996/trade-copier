@@ -281,6 +281,17 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             log.warning("Rejected %s:%s — confidence %.2f below 0.5", ev.channel_id, ev.message_id, conf)
             return {"status": "ignored", "reason": f"confidence {conf:.2f} below 0.5"}
 
+    # ── Reject single-TP signals for Distinct Forex (marketing) ──
+    if action in ("BUY", "SELL") and ev.channel_id == -1001547583661:
+        tp_list = sig.get("tp", [])
+        if isinstance(tp_list, (int, float)):
+            tp_list = [tp_list]
+        if len(tp_list) <= 1:
+            log.warning("Rejected %s:%s — Distinct Forex marketing (only %d TP)",
+                        ev.channel_id, ev.message_id, len(tp_list))
+            await alert(f"Distinct Forex marketing rejected: {action} with only {len(tp_list)} TP(s)")
+            return {"status": "ignored", "reason": "single-TP marketing signal"}
+
     if is_image and action in ("BUY", "SELL"):
         symbol = sig.get("symbol", "XAUUSD")
         pip_sizes = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
@@ -296,22 +307,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
     async with httpx.AsyncClient(timeout=30) as c:
         if action in ("BUY", "SELL"):
-            # --- a) Close existing positions + cancel pending orders for this channel ---
-            close_body = {"comment": ev.channel_title or "signal"}
-            try:
-                close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
-                                          headers=headers, timeout=15)
-                if close_resp.status_code < 400:
-                    result = close_resp.json()
-                    closed = result.get("closed", [])
-                    cancelled = result.get("cancelled", [])
-                    if closed or cancelled:
-                        log.info("Closed %d positions + cancelled %d orders for '%s' before new signal",
-                                 len(closed), len(cancelled), ev.channel_title)
-            except Exception as e:
-                log.warning("close_channel call failed (non-fatal): %s", e)
-
-            # --- b) Build trade body with TP coercion ---
+            # --- a) Build trade body ---
             raw_tp = sig.get("tp")
             if isinstance(raw_tp, (int, float)):
                 raw_tp = [raw_tp]
@@ -338,8 +334,23 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 body["order_type"] = "limit"
                 log.info("entry=%.2f specified — converting market->limit", body["entry"])
 
-            # --- c) Send trade ---
+            # --- b) Send trade FIRST (race for best price) ---
             r = await c.post(f"{BRIDGE_URL}/trade", json=body, headers=headers)
+
+            # --- c) THEN close old positions + cancel old orders ---
+            close_body = {"comment": ev.channel_title or "signal"}
+            try:
+                close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
+                                          headers=headers, timeout=15)
+                if close_resp.status_code < 400:
+                    result = close_resp.json()
+                    closed = result.get("closed", [])
+                    cancelled = result.get("cancelled", [])
+                    if closed or cancelled:
+                        log.info("Closed %d positions + cancelled %d orders for '%s' after new signal",
+                                 len(closed), len(cancelled), ev.channel_title)
+            except Exception as e:
+                log.warning("close_channel call failed (non-fatal): %s", e)
 
         else:
             ref = ev.reply_to_id or ev.message_id

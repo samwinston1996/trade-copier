@@ -7,6 +7,7 @@
 - Handles message deletion events for state reconciliation.
 """
 import asyncio, os, json, base64, logging, time
+from datetime import datetime, timezone
 import httpx
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
@@ -135,6 +136,7 @@ if CHANNELS:
                 "event": "delete",
                 "channel_id": event.chat_id,
                 "message_id": msg_id,
+                "date": datetime.now(timezone.utc).isoformat(),
             }
             await push(payload)  # no hash tracking needed for deletes
 

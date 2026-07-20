@@ -180,8 +180,16 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
     closed = []
     cancelled = []
 
-    # Close all open positions from this channel (safe iteration)
-    for p in iterate_safe(mt5.positions_get()):
+    # ── 1. Close matching positions (retry to warm rpyc cache) ──
+    positions = []
+    for attempt in range(3):
+        positions = iterate_safe(mt5.positions_get())
+        if positions:
+            break
+        log.warning("positions_get() returned empty (attempt %d/3)", attempt + 1)
+        time.sleep(1)
+
+    for p in positions:
         if comment not in sanitize_comment(p.comment or ""):
             continue
         tick = mt5.symbol_info_tick(p.symbol)
@@ -200,24 +208,27 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
         })
         rc = res.retcode if res else -1
         closed.append({"ticket": p.ticket, "symbol": p.symbol, "retcode": rc})
-        log.info("Closed position %s %s -> retcode=%s", p.ticket, p.symbol, rc)
+        if rc == mt5.TRADE_RETCODE_DONE:
+            log.info("Closed position %s %s -> retcode=%s", p.ticket, p.symbol, rc)
+        else:
+            log.warning("Failed to close position %s %s -> retcode=%s", p.ticket, p.symbol, rc)
 
-    # Cancel all pending orders from this channel (safe iteration)
-    import subprocess, json as _json
+    # ── 2. Cancel matching pending orders (direct MT5 call, no subprocess) ──
     for o in iterate_safe(mt5.orders_get()):
         if comment not in sanitize_comment(o.comment or ""):
             continue
-        remove_order = {"action": 3, "order": o.ticket, "symbol": o.symbol}
-        sp = subprocess.run(
-            ["python3", "/app/order_send.py", _json.dumps(remove_order),
-             os.environ["MT5_LOGIN"], os.environ["MT5_PASSWORD"], os.environ["MT5_SERVER"]],
-            capture_output=True, text=True, timeout=15)
-        out = sp.stdout.strip()
-        rc = int(out.split(":")[1]) if out.startswith("OK:") else -1
-        if not out.startswith("OK:"):
-            log.error("cancel_pending subprocess failed: %s", sp.stderr[:200])
+        res = mt5.order_send({
+            "action": mt5.TRADE_ACTION_REMOVE,
+            "order": o.ticket,
+            "symbol": o.symbol,
+            "magic": MAGIC,
+        })
+        rc = res.retcode if res else -1
         cancelled.append({"ticket": o.ticket, "symbol": o.symbol, "retcode": rc})
-        log.info("Cancelled pending order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
+        if rc == mt5.TRADE_RETCODE_DONE:
+            log.info("Cancelled order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
+        else:
+            log.warning("Failed to cancel order %s %s -> retcode=%s", o.ticket, o.symbol, rc)
 
     return {"status": "done", "closed": closed, "cancelled": cancelled}
 
