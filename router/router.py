@@ -337,8 +337,18 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             # --- b) Send trade FIRST (race for best price) ---
             r = await c.post(f"{BRIDGE_URL}/trade", json=body, headers=headers)
 
-            # --- c) THEN close old positions + cancel old orders ---
+            # --- c) Extract ticket IDs from the just-placed trade ---
+            ticket_ids = []
+            if r.status_code < 400:
+                trade_result = r.json()
+                if trade_result.get("status") == "executed":
+                    ticket_ids = [o.get("order", 0) for o in trade_result.get("orders", []) if o.get("order")]
+                log.info("Trade placed — tickets: %s", ticket_ids)
+
+            # --- d) THEN close old positions + cancel old orders (excluding the one we just placed) ---
             close_body = {"comment": ev.channel_title or "signal"}
+            if ticket_ids:
+                close_body["exclude_tickets"] = ticket_ids
             try:
                 close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
                                           headers=headers, timeout=15)

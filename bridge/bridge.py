@@ -67,6 +67,7 @@ class ManageRequest(BaseModel):
 class CloseChannelRequest(BaseModel):
     comment: Optional[str] = None
     symbol: Optional[str] = None
+    exclude_tickets: list[int] = Field(default_factory=list)
 
 
 def auth(authorization: str = Header(None)):
@@ -192,6 +193,9 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
     for p in positions:
         if comment not in sanitize_comment(p.comment or ""):
             continue
+        if p.ticket in req.exclude_tickets:
+            log.info("Skipping position %s (excluded)", p.ticket)
+            continue
         tick = mt5.symbol_info_tick(p.symbol)
         close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         close_price = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
@@ -216,6 +220,9 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
     # ── 2. Cancel matching pending orders (direct MT5 call, no subprocess) ──
     for o in iterate_safe(mt5.orders_get()):
         if comment not in sanitize_comment(o.comment or ""):
+            continue
+        if o.ticket in req.exclude_tickets:
+            log.info("Skipping order %s (excluded)", o.ticket)
             continue
         res = mt5.order_send({
             "action": mt5.TRADE_ACTION_REMOVE,
