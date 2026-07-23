@@ -27,9 +27,11 @@ IMAGE_CHANNEL_IDS = [
     int(c.strip()) for c in os.environ.get("IMAGE_CHANNEL_IDS", "").split(",") if c.strip()
 ]
 
-# ── Edit dedup: track pushed text hashes per message ─────────────
+# ── Edit dedup + debounce: track pushed text hashes per message ──
 # key=(chat_id, msg_id) -> value=(text_hash, timestamp)
 # Only stored on SUCCESSFUL push — prevents signal loss on push failure
+# DEBOUNCE_SECONDS: skip subsequent events for same msg_id within this window
+DEBOUNCE_SECONDS = 3
 last_pushed: dict[tuple[int, int], tuple[int, float]] = {}
 
 client = TelegramClient("/data/tg_session", API_ID, API_HASH)
@@ -111,15 +113,25 @@ async def make_payload(event, kind: str) -> dict:
 if CHANNELS:
     @client.on(events.NewMessage(chats=CHANNELS))
     async def on_new(event):
+        key = (event.chat_id, event.message.id)
+        # Debounce: skip if same msg_id was processed within DEBOUNCE_SECONDS
+        if key in last_pushed and time.time() - last_pushed[key][1] < DEBOUNCE_SECONDS:
+            log.debug("Debounce: skipping new msg %s (processed %.1fs ago)",
+                      event.message.id, time.time() - last_pushed[key][1])
+            return
         payload = await make_payload(event, "new")
         if await push(payload):
-            key = (event.chat_id, event.message.id)
             last_pushed[key] = (hash(event.message.message or ""), time.time())
 
     @client.on(events.MessageEdited(chats=CHANNELS))
     async def on_edit(event):
-        # Skip if text hasn't changed (Telegram auto-formatting edits)
         key = (event.chat_id, event.message.id)
+        # Debounce: skip if same msg_id was processed within DEBOUNCE_SECONDS
+        if key in last_pushed and time.time() - last_pushed[key][1] < DEBOUNCE_SECONDS:
+            log.debug("Debounce: skipping edit msg %s (processed %.1fs ago)",
+                      event.message.id, time.time() - last_pushed[key][1])
+            return
+        # Skip if text hasn't changed (Telegram auto-formatting edits)
         current_hash = hash(event.message.message or "")
         if key in last_pushed and last_pushed[key][0] == current_hash:
             log.debug("Edit didn't change text — skipping msg %s", event.message.id)

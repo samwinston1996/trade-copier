@@ -339,28 +339,56 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
 
             # --- c) Extract ticket IDs from the just-placed trade ---
             ticket_ids = []
+            is_duplicate = False
             if r.status_code < 400:
                 trade_result = r.json()
                 if trade_result.get("status") == "executed":
                     ticket_ids = [o.get("order", 0) for o in trade_result.get("orders", []) if o.get("order")]
+                elif trade_result.get("status") == "duplicate_ignored":
+                    is_duplicate = True
+                    log.info("Bridge returned duplicate_ignored for %s:%s — skipping close_channel",
+                             ev.channel_id, ev.message_id)
                 log.info("Trade placed — tickets: %s", ticket_ids)
 
-            # --- d) THEN close old positions + cancel old orders (excluding the one we just placed) ---
-            close_body = {"comment": ev.channel_title or "signal"}
-            if ticket_ids:
+            # --- d) THEN conditionally close old positions + cancel old orders ---
+            # Guard (Fix B): skip close_channel if no tickets to exclude (prevents self-cancellation)
+            # Guard (Fix B): skip close_channel if bridge said duplicate_ignored
+            # Conditional (Fix C): skip close_channel if same direction + same entry (repost/duplicate)
+            should_close = bool(ticket_ids) and not is_duplicate
+            if should_close and action in ("BUY", "SELL"):
+                current = channel_state.current_signal(str(ev.channel_id))
+                if current:
+                    prev_action = current.get("action")
+                    prev_entry = current.get("entry")
+                    if prev_action == action and prev_entry == sig.get("entry"):
+                        # Same direction, same entry — likely a repost/duplicate from the channel
+                        should_close = False
+                        log.info("Same signal as previous for %s:%s (same direction+entry) — skipping close_channel",
+                                 ev.channel_id, ev.message_id)
+                    elif prev_action != action:
+                        # Direction changed — this is a reversal, close old trades
+                        log.info("Direction change %s→%s for %s:%s — closing old trades",
+                                 prev_action, action, ev.channel_id, ev.message_id)
+
+            if should_close:
+                close_body = {"comment": ev.channel_title or "signal"}
                 close_body["exclude_tickets"] = ticket_ids
-            try:
-                close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
-                                          headers=headers, timeout=15)
-                if close_resp.status_code < 400:
-                    result = close_resp.json()
-                    closed = result.get("closed", [])
-                    cancelled = result.get("cancelled", [])
-                    if closed or cancelled:
-                        log.info("Closed %d positions + cancelled %d orders for '%s' after new signal",
-                                 len(closed), len(cancelled), ev.channel_title)
-            except Exception as e:
-                log.warning("close_channel call failed (non-fatal): %s", e)
+                try:
+                    close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
+                                              headers=headers, timeout=15)
+                    if close_resp.status_code < 400:
+                        result = close_resp.json()
+                        closed = result.get("closed", [])
+                        cancelled = result.get("cancelled", [])
+                        if closed or cancelled:
+                            log.info("Closed %d positions + cancelled %d orders for '%s' after new signal",
+                                     len(closed), len(cancelled), ev.channel_title)
+                except Exception as e:
+                    log.warning("close_channel call failed (non-fatal): %s", e)
+            elif not is_duplicate:
+                log.info("Skipped close_channel for %s:%s (reason: %s)",
+                         ev.channel_id, ev.message_id,
+                         "no tickets returned" if not ticket_ids else "same signal as previous")
 
         else:
             ref = ev.reply_to_id or ev.message_id
