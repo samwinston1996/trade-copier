@@ -307,6 +307,14 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
     async with httpx.AsyncClient(timeout=30) as c:
         if action in ("BUY", "SELL"):
+            # --- Msg_id monotonicity guard ---
+            # Reject signals with msg_id <= current signal's msg_id (out-of-order delivery)
+            current = channel_state.current_signal(str(ev.channel_id))
+            if current and ev.message_id <= current.get("msg_id", 0):
+                log.info("Skipping %s:%s — msg_id %s <= current %s (out of order)",
+                         ev.channel_id, ev.message_id, ev.message_id, current.get("msg_id"))
+                return {"status": "skipped", "reason": f"msg_id {ev.message_id} <= current {current.get('msg_id')} (out of order)"}
+
             # --- a) Build trade body ---
             raw_tp = sig.get("tp")
             if isinstance(raw_tp, (int, float)):

@@ -23,7 +23,7 @@ log = logging.getLogger("bridge")
 
 BRIDGE_TOKEN = os.environ["BRIDGE_TOKEN"]
 RISK_PERCENT = float(os.environ.get("RISK_PERCENT", 1.0))
-MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PERCENT", 4.0))
+# MAX_DAILY_LOSS_PCT removed — daily loss cap disabled per user request
 MAX_GLOBAL_TRADES = int(os.environ.get("MAX_GLOBAL_TRADES", 25))
 MAX_PER_CHANNEL = int(os.environ.get("MAX_PER_CHANNEL_TRADES", 5))
 MAGIC = 777001
@@ -124,17 +124,6 @@ def iterate_safe(mt5_collection, max_retries=3):
             return result
     log.warning("Exhausted retries — returning %d items", len(result))
     return result
-
-
-def daily_loss_exceeded(mt5_client=None) -> bool:
-    mt5 = mt5_client if mt5_client else get_mt5()
-    acct = mt5.account_info()
-    now = datetime.now(timezone.utc)
-    sod = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    sod_ts = int(sod.timestamp())
-    now_ts = int(now.timestamp())
-    deals = mt5.history_deals_get(sod_ts, now_ts) or []
-    return sum(d.profit for d in deals) < -(acct.balance * MAX_DAILY_LOSS_PCT / 100)
 
 
 def calc_lot(symbol: str, entry: float, sl: float, risk_pct: float, mt5_client=None) -> float:
@@ -276,9 +265,6 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
         ]
         if len(channel_positions) >= MAX_PER_CHANNEL:
             raise HTTPException(429, f"max {MAX_PER_CHANNEL} trades reached for channel '{req.comment}'")
-
-        if daily_loss_exceeded(mt5_client=mt5):
-            raise HTTPException(423, "DAILY LOSS CAP HIT — trading disabled today")
 
         symbol = SYMBOL_MAP.get(req.symbol.upper(), req.symbol.upper())
         if not mt5.symbol_select(symbol, True):
