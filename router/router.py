@@ -44,6 +44,7 @@ Rules:
 - NEVER invent prices. If SL or TP is missing for BUY/SELL, set confidence <= 0.3.
 - "close", "take profit now", "secure partials", "SL to breakeven", "move SL to X" -> CLOSE or MODIFY with manage_op.
 - Common signal format: "Entry: X", "Stop Loss: X" (or "SL: X"), "TP1: X" (or "Target: X", "TP: X"). Parse these correctly.
+- Handle emoji-prefixed fields: "💎TP¹ 4092" → TP=4092, "#⃣SL 4073" → SL=4073, "💻XAUUSD BUY 4088" → BUY entry=4088
 - For structured text signals with labeled fields (Entry:, Stop Loss:, TP:), extract the exact numbers after each label.
 - confidence reflects how certain you are the parse is a real, complete, actionable signal.
 - A valid BUY/SELL signal MUST have both SL and TP. Without both, it is incomplete."""
@@ -134,7 +135,7 @@ def parse_with_regex(text: str) -> dict | None:
                 "order_type": "limit", "entry": entry,
                 "sl": sl, "tp": tps, "confidence": 1.0,
             }
-        return {"action": action, "confidence": 0.3}
+        return None  # partial match — let LLM fallback handle
 
     # — BotX format: BUY XAUUSD \n ENTRY: 4120 \n SL: 4110 \n TP: 4137 —
     m = re.search(r'(BUY|SELL)\s+XAUUSD', text)
@@ -151,7 +152,7 @@ def parse_with_regex(text: str) -> dict | None:
                 "order_type": "limit", "entry": entry,
                 "sl": sl, "tp": tps, "confidence": 1.0,
             }
-        return {"action": action, "confidence": 0.3}
+        return None  # partial match — let LLM fallback handle
 
     return None
 
