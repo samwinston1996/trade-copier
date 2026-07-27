@@ -34,6 +34,14 @@ IMAGE_CHANNEL_IDS = [
 DEBOUNCE_SECONDS = 3
 last_pushed: dict[tuple[int, int], tuple[int, float]] = {}
 
+# ── Polling fallback ──
+# Polls every POLL_INTERVAL seconds per channel. Catches messages the
+# event handler may have missed (Telethon subscription fade).
+# Duplicate prevention: tracks last_known msg_id per channel + checks
+# last_pushed dict — zero LLM cost when no messages are missed.
+POLL_INTERVAL = 30
+last_polled_msg_id: dict[int, int] = {}  # channel_id → max msg_id seen
+
 client = TelegramClient("/data/tg_session", API_ID, API_HASH)
 http = httpx.AsyncClient(timeout=30)
 
@@ -110,6 +118,72 @@ async def make_payload(event, kind: str) -> dict:
     return payload
 
 
+# ── Polling helpers ─────────────────────────────────────────
+
+
+async def make_payload_from_msg(msg, channel_id: int, kind: str) -> dict:
+    """Build payload from a Telethon Message object (for polling fallback)."""
+    try:
+        chat = await client.get_entity(channel_id)
+        chat_title = chat.title if hasattr(chat, "title") else ""
+    except Exception:
+        chat_title = ""
+    payload = {
+        "event": kind,
+        "channel_id": channel_id,
+        "channel_title": chat_title,
+        "message_id": msg.id,
+        "reply_to_id": msg.reply_to_msg_id,
+        "text": msg.message or "",
+        "has_media": msg.media is not None,
+        "date": msg.date.isoformat(),
+    }
+    if msg.media is not None and channel_id in IMAGE_CHANNEL_IDS:
+        raw = await msg.download_media(bytes)
+        if raw and len(raw) / 1024 <= MAX_IMAGE_KB:
+            payload["image_data"] = base64.b64encode(raw).decode("ascii")
+            log.info("Polling downloaded image msg %s: %.0f KB", msg.id, len(raw) / 1024)
+    return payload
+
+
+async def poll_channels():
+    """Periodically poll each channel for messages the event handler may have missed.
+    
+    Runs alongside the event handlers. Only pushes messages that:
+    - Have a higher msg_id than the last known (prevents re-pushing old messages)
+    - Are NOT already in last_pushed (prevents duplicating event handler's work)
+    """
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        for channel_id in CHANNELS:
+            try:
+                entity = await client.get_entity(channel_id)
+                msgs = await client.get_messages(entity, limit=1)
+                if not msgs:
+                    continue
+                latest = msgs[0]
+                last_known = last_polled_msg_id.get(channel_id, 0)
+
+                if latest.id <= last_known:
+                    continue  # no new messages
+
+                # Check if event handler already pushed this (debounce protection)
+                key = (channel_id, latest.id)
+                if key in last_pushed:
+                    # Event handler already processed — just update poll tracker
+                    last_polled_msg_id[channel_id] = latest.id
+                    continue
+
+                log.info("Polling caught msg %s in channel %s (last_known=%s)",
+                         latest.id, channel_id, last_known)
+                payload = await make_payload_from_msg(latest, channel_id, "new")
+                if await push(payload):
+                    last_pushed[key] = (hash(latest.message or ""), time.time())
+                    last_polled_msg_id[channel_id] = latest.id
+            except Exception as e:
+                log.debug("Polling error for channel %s: %s", channel_id, e)
+
+
 if CHANNELS:
     @client.on(events.NewMessage(chats=CHANNELS))
     async def on_new(event):
@@ -164,6 +238,9 @@ async def main():
     me = await client.get_me()
     log.info("Logged in as %s. Channels: %s %s", me.first_name, CHANNELS,
              "(DISCOVERY MODE — set TG_CHANNELS in .env)" if not CHANNELS else "")
+    if CHANNELS:
+        asyncio.create_task(poll_channels())
+        log.info("Polling fallback started (every %s sec)", POLL_INTERVAL)
     await client.run_until_disconnected()
 
 
