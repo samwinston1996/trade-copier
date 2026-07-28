@@ -7,6 +7,7 @@ v3:
   - Per-channel + global trade limits
 """
 import os
+import re
 import time
 import logging
 import unicodedata
@@ -168,6 +169,8 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
 
     mt5 = ensure_mt5()
     comment = sanitize_comment(req.comment)
+    # Strip non-ASCII (emojis, etc.) for MT5 matching — MT5 silently drops them
+    comment_key = re.sub(r'[^\x00-\x7F]+', '', comment).strip()
     closed = []
     cancelled = []
 
@@ -186,7 +189,7 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
             time.sleep(1)
 
     for p in positions:
-        if comment not in sanitize_comment(p.comment or ""):
+        if comment_key not in sanitize_comment(p.comment or ""):
             continue
         if p.ticket in req.exclude_tickets:
             log.info("Skipping position %s (excluded)", p.ticket)
@@ -214,7 +217,7 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
 
     # ── 2. Cancel matching pending orders (direct MT5 call, no subprocess) ──
     for o in iterate_safe(mt5.orders_get()):
-        if comment not in sanitize_comment(o.comment or ""):
+        if comment_key not in sanitize_comment(o.comment or ""):
             continue
         if o.ticket in req.exclude_tickets:
             log.info("Skipping order %s (excluded)", o.ticket)
