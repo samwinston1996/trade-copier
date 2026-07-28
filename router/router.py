@@ -230,6 +230,27 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             log.info("Cleaned up MT5 for channel %s after signal deletion", ev.channel_id)
         return {"status": "delete_processed"}
 
+    # ===== 1.5 TP3 HIT DETECTION — cancel pending orders =====
+    TP3_HIT_PATTERN = re.compile(
+        r'(?:TP\s*3\s*HIT|TP3[👏😡🔥]|TP\s*³\s*HIT)',
+        re.I
+    )
+    if ev.text and TP3_HIT_PATTERN.search(ev.text):
+        current = channel_state.current_signal(str(ev.channel_id))
+        if current and len(current.get("tp", [])) >= 3:
+            log.info("TP3 hit for %s:%s — cancelling pending orders for '%s'",
+                     ev.channel_id, ev.message_id, ev.channel_title)
+            headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+            async with httpx.AsyncClient(timeout=15) as c:
+                await c.post(
+                    f"{BRIDGE_URL}/close_channel",
+                    json={"comment": ev.channel_title or str(ev.channel_id),
+                          "pending_only": True},
+                    headers=headers,
+                )
+            await alert(f"TP3 hit — cancelled pending for {ev.channel_title}: {ev.text[:200]}")
+            return {"status": "tp3_hit_cleaned", "channel": ev.channel_title}
+
     # ===== 2. ROUTE TO PARSER =====
     is_image = False
     has_image = ev.image_data and len(ev.image_data) > 100

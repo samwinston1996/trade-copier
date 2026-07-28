@@ -68,6 +68,7 @@ class CloseChannelRequest(BaseModel):
     comment: Optional[str] = None
     symbol: Optional[str] = None
     exclude_tickets: list[int] = Field(default_factory=list)
+    pending_only: bool = False
 
 
 def auth(authorization: str = Header(None)):
@@ -170,14 +171,19 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
     closed = []
     cancelled = []
 
+    # ── 0. Skip position closing if pending_only ──
+    if req.pending_only:
+        log.info("pending_only=True — skipping position close, only cancelling pending orders")
+
     # ── 1. Close matching positions (retry to warm rpyc cache) ──
     positions = []
-    for attempt in range(3):
-        positions = iterate_safe(mt5.positions_get())
-        if positions:
-            break
-        log.warning("positions_get() returned empty (attempt %d/3)", attempt + 1)
-        time.sleep(1)
+    if not req.pending_only:
+        for attempt in range(3):
+            positions = iterate_safe(mt5.positions_get())
+            if positions:
+                break
+            log.warning("positions_get() returned empty (attempt %d/3)", attempt + 1)
+            time.sleep(1)
 
     for p in positions:
         if comment not in sanitize_comment(p.comment or ""):
