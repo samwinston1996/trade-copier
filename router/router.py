@@ -231,8 +231,9 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         return {"status": "delete_processed"}
 
     # ===== 1.5 TP3 HIT DETECTION — cancel pending orders =====
+    # Case-insensitive. Handles typo variants: HIT, HlT (L instead of I), H1T (1 instead of I)
     TP3_HIT_PATTERN = re.compile(
-        r'(?:TP\s*3\s*HIT|TP3[👏😡🔥]|TP\s*³\s*HIT)',
+        r'(?:TP\s*3\s*H[I1lL]T|TP3[👏😡🔥]|TP\s*³\s*H[I1lL]T|TP\s*3\s*ALL|ALL\s*TP)',
         re.I
     )
     if ev.text and TP3_HIT_PATTERN.search(ev.text):

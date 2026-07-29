@@ -40,7 +40,23 @@ last_pushed: dict[tuple[int, int], tuple[int, float]] = {}
 # Duplicate prevention: tracks last_known msg_id per channel + checks
 # last_pushed dict — zero LLM cost when no messages are missed.
 POLL_INTERVAL = 30
-last_polled_msg_id: dict[int, int] = {}  # channel_id → max msg_id seen
+POLL_STATE_FILE = "/data/poll_state.json"  # persisted so last_known survives restarts
+
+def load_poll_state() -> dict[int, int]:
+    try:
+        with open(POLL_STATE_FILE) as f:
+            raw = json.load(f)
+            return {int(k): v for k, v in raw.items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+def save_poll_state(state: dict[int, int]):
+    tmp = POLL_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, POLL_STATE_FILE)
+
+last_polled_msg_id: dict[int, int] = load_poll_state()  # channel_id -> max msg_id seen
 
 client = TelegramClient("/data/tg_session", API_ID, API_HASH)
 http = httpx.AsyncClient(timeout=30)
@@ -172,6 +188,7 @@ async def poll_channels():
                 if key in last_pushed:
                     # Event handler already processed — just update poll tracker
                     last_polled_msg_id[channel_id] = latest.id
+                    save_poll_state(last_polled_msg_id)
                     continue
 
                 log.info("Polling caught msg %s in channel %s (last_known=%s)",
@@ -180,6 +197,7 @@ async def poll_channels():
                 if await push(payload):
                     last_pushed[key] = (hash(latest.message or ""), time.time())
                     last_polled_msg_id[channel_id] = latest.id
+                    save_poll_state(last_polled_msg_id)
             except Exception as e:
                 log.debug("Polling error for channel %s: %s", channel_id, e)
 
