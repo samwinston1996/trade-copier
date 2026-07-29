@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CEO Dashboard — Signal lifecycle with Telegram times."""
+"""CEO Dashboard — Signal lifecycle via position_id matching."""
 import smtplib, os, time, re, subprocess
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
@@ -52,90 +52,82 @@ acct = mt5.account_info()
 balance = acct.balance if acct else 0
 mt5.shutdown()
 
-# ── Deal classifier ──
-entries, exits = [], []
+# ── Group deals by position_id ──
+positions = defaultdict(lambda: {"id": None, "entry": None, "exit": None, "profit": 0.0})
+entries_list = []
+
 for d in deals:
+    pid = getattr(d, 'position_id', 0)
+    if not pid: continue
     c = str(d.comment or "")
-    is_tp = c.startswith("[tp")
-    is_sl = c.startswith("[sl")
-    if is_tp or is_sl:
-        exits.append({"t":d.time,"sym":d.symbol,"vol":d.volume,"pl":d.profit,"com":c,"tp":is_tp,"typ":d.type})
+    is_exit = c.startswith("[tp") or c.startswith("[sl")
+    
+    if is_exit:
+        if positions[pid]["exit"] is None or d.time > positions[pid]["exit"]["t"]:
+            positions[pid]["exit"] = {"t": d.time, "sym": d.symbol, "vol": d.volume, "pl": d.profit, "tp": c.startswith("[tp")}
+        positions[pid]["profit"] += d.profit
     else:
-        entries.append({"t":d.time,"sym":d.symbol,"vol":d.volume,"pl":d.profit,"com":c[:25],"typ":d.type})
+        if positions[pid]["entry"] is None:
+            positions[pid]["entry"] = {"t": d.time, "sym": d.symbol, "vol": d.volume, "pl": d.profit, "com": c[:25], "typ": d.type}
+            positions[pid]["id"] = pid
+        positions[pid]["profit"] += d.profit
 
-# ── Group entries into signal batches ──
-entries.sort(key=lambda x: x["t"])
-batches, used = [], set()
-for i, e in enumerate(entries):
+# Filter: only positions with an entry (real positions)
+positions = {pid: p for pid, p in positions.items() if p["entry"] and p["id"]}
+
+# ── Group positions into signal batches ──
+all_pos = sorted(positions.values(), key=lambda p: p["entry"]["t"])
+batches = []
+used = set()
+for i, p in enumerate(all_pos):
     if i in used: continue
-    b = [e]; used.add(i)
-    for j in range(i+1, len(entries)):
+    e = p["entry"]
+    batch = [p]; used.add(i)
+    for j in range(i+1, len(all_pos)):
         if j in used: continue
-        ej = entries[j]
+        ej = all_pos[j]["entry"]
         if ej["com"]==e["com"] and ej["typ"]==e["typ"] and abs(ej["t"]-e["t"])<30 and ej["sym"]==e["sym"]:
-            b.append(ej); used.add(j)
-    if b: batches.append(b)
+            batch.append(all_pos[j]); used.add(j)
+    if batch: batches.append(batch)
 
-# ── Group exits into batches too ──
-exits.sort(key=lambda x: x["t"])
-exit_batches = []
-used_ex = set()
-for i, e in enumerate(exits):
-    if i in used_ex: continue
-    b = [e]; used_ex.add(i)
-    for j in range(i+1, len(exits)):
-        if j in used_ex: continue
-        ej = exits[j]
-        if ej["sym"]==e["sym"] and ej["tp"]==e["tp"] and abs(ej["t"]-e["t"])<30 and abs(ej["vol"]-e["vol"])<0.02:
-            b.append(ej); used_ex.add(j)
-    if b: exit_batches.append(b)
-
-# ── Match exit batches to entry batches ──
-def is_near(a, b, eps=0.05):
-    return abs(a - b) <= eps
+# ── Telegram time lookup ──
+def find_tg(ch, entry_t):
+    best, bg = None, 999
+    for rs in router_signals:
+        if rs["action"] in ("TP3_HIT","IGNORE"): continue
+        if rs["ch"].startswith(ch) or ch.startswith(rs["ch"]):
+            g = abs(rs["ts"] - entry_t)
+            if g < 300 and g < bg: bg, best = g, rs
+    return best
 
 # ── Build signal lifecycle ──
 signal_rows = ""
-seen_batches = set()
 ch_stats = defaultdict(lambda: {"n":0,"tp":0,"sl":0,"pnl":0.0})
+exit_positions_used = set()
 
 for batch in batches:
-    bid = id(batch)
-    if bid in seen_batches: continue
-    seen_batches.add(bid)
-    
-    ch = batch[0]["com"] or batch[0]["sym"]
-    direction = "BUY" if batch[0]["typ"]==0 else "SELL"
-    sym = batch[0]["sym"]
-    vol = sum(x["vol"] for x in batch)
-    entry_t = min(x["t"] for x in batch)
+    ch = batch[0]["entry"]["com"] or batch[0]["entry"]["sym"]
+    direction = "BUY" if batch[0]["entry"]["typ"]==0 else "SELL"
+    sym = batch[0]["entry"]["sym"]
+    vol = sum(p["entry"]["vol"] for p in batch)
+    entry_t = min(p["entry"]["t"] for p in batch)
     entry_str = datetime.fromtimestamp(entry_t, tz=IST).strftime("%H:%M")
     
     # Telegram time
-    rs = None
-    for candidate in router_signals:
-        if candidate["action"] in ("TP3_HIT","IGNORE"): continue
-        if candidate["ch"].startswith(ch) or ch.startswith(candidate["ch"]):
-            g = abs(candidate["ts"] - entry_t)
-            if g < 300: rs = candidate
+    rs = find_tg(ch, entry_t)
     tg_t = rs["ts"] if rs else entry_t
     tg_str = datetime.fromtimestamp(tg_t, tz=IST).strftime("%H:%M")
     
-    # Find matching exit batch
-    matched_eb = None
-    tot_bv = sum(x["vol"] for x in batch)
-    for exb in exit_batches:
-        exv = sum(x["vol"] for x in exb)
-        if exb[0]["sym"] != sym: continue
-        if abs(exv - tot_bv) > 0.05: continue
-        tg = abs(exb[0]["t"] - entry_t)
-        if 0 < tg < 86400:
-            matched_eb = exb
-            break
+    # Collect exits from all positions in this batch
+    mexits = []
+    total_pl = 0.0
+    for p in batch:
+        if p["exit"]:
+            mexits.append(p["exit"])
+            total_pl += p["exit"]["pl"]
     
-    tps = [x for x in (matched_eb or []) if x["tp"]]
-    sls = [x for x in (matched_eb or []) if not x["tp"]]
-    total_pl = sum(x["pl"] for x in (matched_eb or []))
+    tps = [x for x in mexits if x["tp"]]
+    sls = [x for x in mexits if not x["tp"]]
     
     # Status
     if tps and sls:
@@ -148,12 +140,11 @@ for batch in batches:
         et = datetime.fromtimestamp(max(x["t"] for x in sls), tz=IST).strftime("%H:%M")
         status = f"❌ SL Hit ({len(sls)}×) @ {et}"
     else:
-        # Check TP3 or replaced
         is_tp3 = any(rs2["action"]=="TP3_HIT" and (rs2["ch"].startswith(ch) or ch.startswith(rs2["ch"])) and entry_t < rs2["ts"] < entry_t+86400 for rs2 in router_signals)
-        is_replaced = any(ob is not batch and ob[0]["com"]==ch and abs(min(x["t"] for x in ob)-entry_t) < 3600 for ob in batches)
+        is_replaced = any(ob is not batch and ob[0]["entry"]["com"]==ch and abs(ob[0]["entry"]["t"]-entry_t) < 3600 for ob in batches)
         status = "🧹 TP3 Cleaned" if is_tp3 else ("🔄 Replaced" if is_replaced else "⏳ Open")
     
-    exit_t = datetime.fromtimestamp(max(x["t"] for x in matched_eb), tz=IST).strftime("%H:%M") if matched_eb else "—"
+    exit_t = datetime.fromtimestamp(max(x["t"] for x in mexits), tz=IST).strftime("%H:%M") if mexits else "—"
     pc = "green" if total_pl >= 0 else "red"
     
     ch_stats[ch]["n"] += 1
@@ -180,21 +171,21 @@ def get_day_pnl(day_start):
         m.initialize(login=int(os.environ["MT5_LOGIN"]), password=os.environ["MT5_PASSWORD"], server=os.environ["MT5_SERVER"])
         dd = list(m.history_deals_get(int(day_start), int(day_start+86400)) or [])
         m.shutdown()
-        entries_d, exits_d = [], []
+        pos = defaultdict(lambda: {"entry": None, "pnl": 0.0})
         for x in dd:
+            pid = getattr(x, 'position_id', 0)
+            if not pid: continue
             c = str(x.comment or "")
-            if c.startswith("[tp") or c.startswith("[sl"): exits_d.append(x)
-            else: entries_d.append(x)
-        # Group entry by channel
-        channel_profits = defaultdict(float)
-        for ex in exits_d:
-            for en in entries_d:
-                if en.symbol != ex.symbol: continue
-                if (en.type == 0 and ex.type == 1) or (en.type == 1 and ex.type == 0):
-                    if abs(en.volume - ex.volume) < 0.02 and abs(ex.time - en.time) < 86400:
-                        channel_profits[str(en.comment or "")[:20]] += ex.profit
-                        break
-        return dict(channel_profits)
+            if not c.startswith("[tp") and not c.startswith("[sl"):
+                if pos[pid]["entry"] is None:
+                    pos[pid]["entry"] = str(x.comment or "")[:20]
+            else:
+                pos[pid]["pnl"] += x.profit
+        cp = defaultdict(float)
+        for pid, data in pos.items():
+            if data["entry"]:
+                cp[data["entry"]] += data["pnl"]
+        return dict(cp)
     except:
         return {}
 
@@ -209,17 +200,18 @@ day_labels = [datetime.fromtimestamp(today_start_utc-(do*86400), tz=IST).strftim
 trend_rows = ""
 for ch in sorted(ch_stats, key=lambda c: ch_stats[c]["pnl"], reverse=True):
     vals = [wtd[ch].get(f"d{-d}",0) for d in range(6,-1,-1)]
-    vs = "".join(f'<td style="color:{"green" if v>=0 else "red"};font-size:11px">${v:+.0f}</td>' for v in vals)
+    vs = "".join(f'<td style="color:{"green" if v>=0 else "red"}">${v:+.0f}</td>' for v in vals)
     tt = sum(vals); tc = "green" if tt>=0 else "red"
     trend_rows += f"<tr><td>{ch}</td>{vs}<td style='font-weight:bold;color:{tc}'>${tt:+.2f}</td></tr>"
 
 # ── Totals ──
-today_pnl = sum(e["pl"] for e in exits)
-today_tp = sum(1 for e in exits if e["tp"])
-today_sl = sum(1 for e in exits if not e["tp"])
+today_pnl = sum(p["exit"]["pl"] for p in positions.values() if p["exit"])
+today_tp = sum(1 for p in positions.values() if p["exit"] and p["exit"]["tp"])
+today_sl = sum(1 for p in positions.values() if p["exit"] and not p["exit"]["tp"])
 wr = (today_tp/(today_tp+today_sl)*100) if today_tp+today_sl>0 else 0
 date_str = datetime.now(tz=IST).strftime("%b %d, %Y")
 oc = "green" if today_pnl>=0 else "red"
+
 ch_rows = ""
 for ch in sorted(ch_stats, key=lambda c: ch_stats[c]["pnl"], reverse=True):
     s = ch_stats[ch]; t = s["tp"]+s["sl"]; w = (s["tp"]/t*100) if t>0 else 0
@@ -265,7 +257,6 @@ tr:hover {{ background:#f8f9ff; }}
 msg = MIMEText(html, "html")
 msg["Subject"] = f"Hermes Trade Copier — {date_str} | ${today_pnl:+.2f}"
 msg["From"] = EMAIL; msg["To"] = RECIPIENT
-
 srv = smtplib.SMTP("smtp.gmail.com", 587)
 srv.starttls(); srv.login(EMAIL, PASSWORD)
 srv.sendmail(EMAIL, [RECIPIENT], msg.as_string()); srv.quit()
