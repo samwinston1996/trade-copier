@@ -189,7 +189,8 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
             time.sleep(1)
 
     for p in positions:
-        if comment_key not in sanitize_comment(p.comment or ""):
+        c = sanitize_comment(p.comment or "")
+        if comment_key not in c and c not in comment_key:
             continue
         if p.ticket in req.exclude_tickets:
             log.info("Skipping position %s (excluded)", p.ticket)
@@ -217,7 +218,8 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
 
     # ── 2. Cancel matching pending orders (direct MT5 call, no subprocess) ──
     for o in iterate_safe(mt5.orders_get()):
-        if comment_key not in sanitize_comment(o.comment or ""):
+        c = sanitize_comment(o.comment or "")
+        if comment_key not in c and c not in comment_key:
             continue
         if o.ticket in req.exclude_tickets:
             log.info("Skipping order %s (excluded)", o.ticket)
