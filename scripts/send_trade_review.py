@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""CEO Dashboard — Signal lifecycle via position_id matching."""
-import smtplib, os, time, re, subprocess
+"""CEO Dashboard — Signal lifecycle via position_id matching + daily P&L history."""
+import smtplib, os, time, re, subprocess, sqlite3
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from collections import defaultdict
@@ -17,6 +17,13 @@ if not EMAIL or not PASSWORD: print("Creds missing"); exit(1)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 now_ts = time.time()
+
+# ── Skip weekends ──
+today_weekday = datetime.fromtimestamp(now_ts, tz=IST).weekday()
+if today_weekday >= 5:  # 5=Sat, 6=Sun
+    print("Weekend — skipping email")
+    exit(0)
+
 today_start_utc = now_ts - (now_ts % 86400)
 
 # ── Router signals ──
@@ -164,47 +171,105 @@ for o in orders:
         co = str(o.comment or "")[:20]
         signal_rows += f"<tr style='opacity:0.6'><td nowrap>{ts}</td><td>{co}</td><td>{ot.split('_')[0]}</td><td>{o.symbol}</td><td>—</td><td>—</td><td>—</td><td>🚫 Expired @ {pr}</td><td>$0.00</td></tr>"
 
-# ── Week trend ──
-def get_day_pnl(day_start):
-    try:
-        m = MetaTrader5(host="localhost", port=8001)
-        m.initialize(login=int(os.environ["MT5_LOGIN"]), password=os.environ["MT5_PASSWORD"], server=os.environ["MT5_SERVER"])
-        dd = list(m.history_deals_get(int(day_start), int(day_start+86400)) or [])
-        m.shutdown()
-        pos = defaultdict(lambda: {"entry": None, "pnl": 0.0})
-        for x in dd:
-            pid = getattr(x, 'position_id', 0)
-            if not pid: continue
-            c = str(x.comment or "")
-            if not c.startswith("[tp") and not c.startswith("[sl"):
-                if pos[pid]["entry"] is None:
-                    pos[pid]["entry"] = str(x.comment or "")[:20]
-            else:
-                pos[pid]["pnl"] += x.profit
-        cp = defaultdict(float)
-        for pid, data in pos.items():
-            if data["entry"]:
-                cp[data["entry"]] += data["pnl"]
-        return dict(cp)
-    except:
-        return {}
+# ════════════════════════════════════════════════════════════
+# ── Persist today's per-channel P&L to SQLite ──
+# ════════════════════════════════════════════════════════════
 
-wtd = defaultdict(lambda: defaultdict(float))
-for do in range(7):
-    ds = today_start_utc - (do * 86400)
-    day_data = get_day_pnl(ds)
-    for ch_name, pl in day_data.items():
-        wtd[ch_name][f"d{-do}"] += pl
+DB_PATH = "/tmp/daily_pnl.db"
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+c = conn.cursor()
+c.execute("""
+    CREATE TABLE IF NOT EXISTS daily_pnl (
+        date TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        pnl REAL NOT NULL DEFAULT 0.0,
+        tp INTEGER NOT NULL DEFAULT 0,
+        sl INTEGER NOT NULL DEFAULT 0,
+        signals INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (date, channel)
+    )
+""")
 
-day_labels = [datetime.fromtimestamp(today_start_utc-(do*86400), tz=IST).strftime("%a") for do in range(6,-1,-1)]
-trend_rows = ""
-for ch in sorted(ch_stats, key=lambda c: ch_stats[c]["pnl"], reverse=True):
-    vals = [wtd[ch].get(f"d{-d}",0) for d in range(6,-1,-1)]
-    vs = "".join(f'<td style="color:{"green" if v>=0 else "red"}">${v:+.0f}</td>' for v in vals)
-    tt = sum(vals); tc = "green" if tt>=0 else "red"
-    trend_rows += f"<tr><td>{ch}</td>{vs}<td style='font-weight:bold;color:{tc}'>${tt:+.2f}</td></tr>"
+today_date = datetime.now(tz=IST).strftime("%Y-%m-%d")
 
-# ── Totals ──
+for ch, stats in ch_stats.items():
+    c.execute("""
+        INSERT INTO daily_pnl (date, channel, pnl, tp, sl, signals)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date, channel) DO UPDATE SET
+            pnl = excluded.pnl,
+            tp = excluded.tp,
+            sl = excluded.sl,
+            signals = excluded.signals
+    """, (today_date, ch, stats["pnl"], stats["tp"], stats["sl"], stats["n"]))
+
+conn.commit()
+
+# ── Query all historical data for the daily performance table ──
+c.execute("SELECT date, channel, pnl FROM daily_pnl ORDER BY date ASC, channel ASC")
+db_rows = c.fetchall()
+conn.close()
+
+# Build the daily performance table (days as rows, channels as columns)
+day_data = {}       # date -> {channel -> pnl}
+channel_totals = defaultdict(float)
+date_labels = []
+
+for r in db_rows:
+    d = r["date"]
+    ch = r["channel"]
+    pnl = r["pnl"]
+    if d not in day_data:
+        day_data[d] = {}
+        date_labels.append(d)
+    day_data[d][ch] = pnl
+    channel_totals[ch] += pnl
+
+# Sort channels by total P&L descending
+all_channels = sorted(channel_totals.keys(), key=lambda c: channel_totals[c], reverse=True)
+
+# Render daily performance HTML
+daily_table_rows = ""
+for d in date_labels:
+    cells = ""
+    day_pnl_total = 0.0
+    for ch in all_channels:
+        v = day_data[d].get(ch)
+        if v is not None:
+            c = "green" if v >= 0 else "red"
+            cells += f'<td style="color:{c}">${v:+.2f}</td>'
+            day_pnl_total += v
+        else:
+            cells += "<td style='color:#ccc'>—</td>"
+    dt_str = datetime.strptime(d, "%Y-%m-%d").strftime("%a %b %-d")
+    dc = "green" if day_pnl_total >= 0 else "red"
+    cells += f'<td style="font-weight:bold;color:{dc}">${day_pnl_total:+.2f}</td>'
+    daily_table_rows += f"<tr><td nowrap>{dt_str}</td>{cells}</tr>"
+
+# Total row
+total_cells = ""
+grand_total = 0.0
+for ch in all_channels:
+    v = channel_totals[ch]
+    c = "green" if v >= 0 else "red"
+    total_cells += f'<td style="font-weight:bold;color:{c}">${v:+.2f}</td>'
+    grand_total += v
+gtc = "green" if grand_total >= 0 else "red"
+total_cells += f'<td style="font-weight:bold;color:{gtc}">${grand_total:+.2f}</td>'
+
+channel_headers = "".join(f"<th>{ch}</th>" for ch in all_channels)
+
+daily_section = f"""<div class="section"><h3>📊 Daily Performance</h3><table>
+<tr><th>Date</th>{channel_headers}<th>Total</th></tr>
+{daily_table_rows}
+<tr style="background:#f0f0f0;font-weight:bold"><td>TOTAL</td>{total_cells}</tr>
+</table></div>"""
+
+# ════════════════════════════════════════════════════════════
+# ── Build HTML ──
+# ════════════════════════════════════════════════════════════
+
 today_pnl = sum(p["exit"]["pl"] for p in positions.values() if p["exit"])
 today_tp = sum(1 for p in positions.values() if p["exit"] and p["exit"]["tp"])
 today_sl = sum(1 for p in positions.values() if p["exit"] and not p["exit"]["tp"])
@@ -246,7 +311,7 @@ tr:hover {{ background:#f8f9ff; }}
 {ch_rows}
 <tr style="background:#f0f0f0;font-weight:bold"><td>TOTAL</td><td>{len(batches)}</td><td>{today_tp}</td><td>{today_sl}</td><td>{wr:.0f}%</td><td style="color:{oc}">${today_pnl:+.2f}</td></tr>
 </table></div>
-<div class="section"><h3>📊 Week-to-Date</h3><table><tr><th>Channel</th>{"".join(f'<th>{dl}</th>' for dl in day_labels)}<th>Total</th></tr>{trend_rows}</table></div>
+{daily_section}
 <div class="section"><h3>📋 Signal Lifecycle</h3><table>
 <tr><th>Telegram</th><th>Channel</th><th>Dir</th><th>Sym</th><th>Lot</th><th>MT5 Entry</th><th>TP/SL Time</th><th>Status</th><th>P&amp;L</th></tr>
 {signal_rows}
