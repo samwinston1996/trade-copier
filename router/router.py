@@ -47,7 +47,11 @@ Rules:
 - Handle emoji-prefixed fields: "💎TP¹ 4092" → TP=4092, "#⃣SL 4073" → SL=4073, "💻XAUUSD BUY 4088" → BUY entry=4088
 - For structured text signals with labeled fields (Entry:, Stop Loss:, TP:), extract the exact numbers after each label.
 - confidence reflects how certain you are the parse is a real, complete, actionable signal.
-- A valid BUY/SELL signal MUST have both SL and TP. Without both, it is incomplete."""
+|- A valid BUY/SELL signal MUST have both SL and TP. Without both, it is incomplete.
+|- "Sell Now @ X - Y" or "Buy Now @ X - Y" → action=SELL/BUY. entry = MIDPOINT of the range. Never return None for entry.
+|- "Gold Sell Now @ X - Y" or "Gold Buy Now @ X - Y" → as above, symbol = XAUUSD.
+|- "TP1: X" (numeric) → valid first TP. "TP2: later" or any non-numeric TP → ignore that line, treat as single-TP signal.
+|- A signal with a valid numeric SL and at least one valid numeric TP is complete and actionable."""
 
 IMAGE_SYSTEM_PROMPT = """You are a trade-signal parser for CHART IMAGES. Input: a screenshot of a trading chart with two adjacent shaded zones.
 Output: ONLY a single JSON object, no prose, no markdown fences.
@@ -153,6 +157,23 @@ def parse_with_regex(text: str) -> dict | None:
                 "sl": sl, "tp": tps, "confidence": 1.0,
             }
         return None  # partial match — let LLM fallback handle
+
+    # — Paul GOLD Dominator: "Gold Sell Now @ 4377 - 4385 / SL: 4387 / TP1: 4367 / TP2: 4357" —
+    m = re.search(r'(?:Gold\s+)?(?:Sell|Buy)\s+Now\s*@\s*(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)', text, re.I)
+    if m:
+        lo, hi = float(m.group(1)), float(m.group(2))
+        entry = round((lo + hi) / 2, 2)  # midpoint — deterministic
+        sl_m = re.search(r'SL:?\s*(\d+\.?\d*)', text)
+        tps = [float(x) for x in re.findall(r'TP\d?:?\s*(\d+\.?\d*)', text)]
+        if sl_m and tps:
+            action = "SELL" if re.search(r'Sell', text, re.I) else "BUY"
+            return {
+                "action": action, "symbol": "XAUUSD",
+                "order_type": "limit", "entry": entry,
+                "sl": float(sl_m.group(1)), "tp": tps,
+                "confidence": 1.0,
+            }
+        return None  # partial → LLM fallback
 
     return None
 

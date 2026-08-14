@@ -18,23 +18,24 @@ if not EMAIL or not PASSWORD: print("Creds missing"); exit(1)
 IST = timezone(timedelta(hours=5, minutes=30))
 now_ts = time.time()
 
-# ── Skip weekends ──
-today_weekday = datetime.fromtimestamp(now_ts, tz=IST).weekday()
+# ── Skip weekends (UTC — cron is UTC-based) ──
+today_weekday = datetime.fromtimestamp(now_ts, tz=timezone.utc).weekday()
 if today_weekday >= 5:  # 5=Sat, 6=Sun
     print("Weekend — skipping email")
     exit(0)
 
 today_start_utc = now_ts - (now_ts % 86400)
+today_date = datetime.fromtimestamp(today_start_utc, tz=IST).strftime("%Y-%m-%d")
 
 # ── Router signals ──
 def get_router_signals():
     r = subprocess.run("docker logs router --tail 5000 2>&1", shell=True, capture_output=True, text=True, timeout=15)
     sigs = []
-    cm = {"-1002045136062":"Gold Vision","-1001766321748":"star fx trade",
-          "-1001916021658":"XAUUSD ANALYSIS TEAM","-1002110392082":"Ak Capital VIP",
-          "-1001777167655":"GOLD_GBP_KILLER","-1001918089511":"Distinct Forex",
-          "-1001519298737":"Trade.inn FOREX","-1001327204060":"GOLD PIPS HUNTER",
-          "-1002639766136":"Gold Vision (Bold)","-1002280058493":"BotX"}
+    cm = {"-1002045136062":"BotX channel","-1001766321748":"Trade.inn FOREX",
+          "-1001916021658":"star fx trade","-1002110392082":"XAUUSD ANALYSIS TEAM",
+          "-1001777167655":"GOLD_GBP_KILLER","-1001918089511":"Paul GOLD Dominator",
+          "-1001519298737":"Ak Capital VIP","-1001327204060":"GOLD PIPS HUNTER",
+          "-1002639766136":"Gold Vision","-1002280058493":"XAUUSD BEST TRADER"}
     for line in r.stdout.split('\n'):
         m = re.search(r'(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}),\d{3} INFO parsed (-?\d+):(\d+) -> (\w+) conf=([\d.]+)', line)
         if m:
@@ -190,8 +191,6 @@ c.execute("""
         PRIMARY KEY (date, channel)
     )
 """)
-
-today_date = datetime.now(tz=IST).strftime("%Y-%m-%d")
 
 for ch, stats in ch_stats.items():
     c.execute("""
