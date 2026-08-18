@@ -292,7 +292,9 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         if has_image and not is_image_channel:
             log.info("Channel %s has image but not in IMAGE_CHANNEL_IDS — routing to TEXT parser",
                      ev.channel_id)
-        log.info("Routing msg %s to TEXT parser", ev.message_id)
+        log.info("Routing msg %s from channel %s to TEXT parser", ev.message_id, ev.channel_id)
+        if ev.channel_id == -1001918089511:
+            log.info("=== PAUL DEBUG === text=%s", ev.text[:500])
 
         # Try regex pre-filter first (zero LLM cost)
         sig = parse_with_regex(ev.text)
