@@ -94,6 +94,7 @@ class ListenerEvent(BaseModel):
     has_media: bool = False
     image_data: Optional[str] = None
     date: str
+    request_id: str = ""
 
 
 async def alert(msg: str):
@@ -233,6 +234,9 @@ def health():
 async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if authorization != f"Bearer {WEBHOOK_TOKEN}":
         raise HTTPException(401, "bad token")
+
+    log.info("Webhook: event=%s msg=%s channel=%s req=%s",
+             ev.event, ev.message_id, ev.channel_id, ev.request_id)
 
     # ===== 1. DELETE EVENT — revert channel state, clean up MT5 =====
     if ev.event == "delete":

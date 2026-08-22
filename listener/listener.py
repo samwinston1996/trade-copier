@@ -59,24 +59,31 @@ def save_poll_state(state: dict[int, int]):
 last_polled_msg_id: dict[int, int] = load_poll_state()  # channel_id -> max msg_id seen
 
 client = TelegramClient("/data/tg_session", API_ID, API_HASH)
-http = httpx.AsyncClient(timeout=30)
 
 
 async def push(payload: dict) -> bool:
-    """Push payload to router webhook. Returns True on success, False on dead-letter."""
+    """Push payload to router webhook. Returns True on success, False on dead-letter.
+    Creates a fresh httpx client per push attempt to avoid stale TCP keep-alive
+    connections that can swallow responses (router HTTP 200 but handler never called).
+    Each payload gets a unique request_id for end-to-end traceability.
+    """
+    import uuid
+    request_id = uuid.uuid4().hex[:12]
+    payload = {**payload, "request_id": request_id}
     for attempt in range(3):
         try:
-            r = await http.post(WEBHOOK, json=payload,
-                                headers={"Authorization": f"Bearer {TOKEN}"})
-            r.raise_for_status()
-            log.info("Pushed msg %s (%s)", payload["message_id"], payload["event"])
+            async with httpx.AsyncClient(timeout=30) as http:
+                r = await http.post(WEBHOOK, json=payload,
+                                    headers={"Authorization": f"Bearer {TOKEN}"})
+                r.raise_for_status()
+            log.info("Pushed msg %s (%s) req=%s", payload["message_id"], payload["event"], request_id)
             return True
         except Exception as e:
-            log.warning("Push attempt %d failed: %s", attempt + 1, e)
+            log.warning("Push attempt %d failed: %s (req=%s)", attempt + 1, e, request_id)
             await asyncio.sleep(2 ** attempt)
     with open("/data/failed_pushes.jsonl", "a") as f:
         f.write(json.dumps(payload) + "\n")
-    log.error("DEAD-LETTERED message %s — check failed_pushes.jsonl", payload["message_id"])
+    log.error("DEAD-LETTERED message %s req=%s — check failed_pushes.jsonl", payload["message_id"], request_id)
     return False
 
 
