@@ -76,6 +76,14 @@ async def push(payload: dict) -> bool:
                 r = await http.post(WEBHOOK, json=payload,
                                     headers={"Authorization": f"Bearer {TOKEN}"})
                 r.raise_for_status()
+                body = r.json()
+                status = body.get("status", "")
+                # Valid router responses carry a known status string.
+                # Unexpected status (or phantom 200 with no body) means the
+                # handler may have silently dropped the request — retry.
+                if status not in ("forwarded", "tp3_hit_cleaned", "delete_processed", "ignored", "skipped"):
+                    log.warning("Push returned status=%r (req=%s) — retrying", status, request_id)
+                    raise RuntimeError(f"unexpected router status: {status}")
             log.info("Pushed msg %s (%s) req=%s", payload["message_id"], payload["event"], request_id)
             return True
         except Exception as e:
