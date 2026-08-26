@@ -7,6 +7,7 @@ v3:
   - Per-channel + global trade limits
 """
 import os
+import json
 import re
 import time
 import logging
@@ -57,12 +58,13 @@ class TradeRequest(BaseModel):
     comment: str = "tg-copier"
     signal_id: str
     from_image: bool = False
+    pending_tp: bool = False  # Auto-generate temp SL/TP from market price
 
 
 class ManageRequest(BaseModel):
     signal_id: str
     comment: Optional[str] = None
-    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp"]
+    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp", "modify_signal"]
     value: Optional[float] = None
     tp_values: Optional[str] = None  # JSON array, e.g. "[4655, 4640, 4615]"
 
@@ -261,10 +263,11 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
 
     try:
         # --- Validation ---
-        if not req.tp or all(t == 0 for t in req.tp):
-            raise HTTPException(400, "TP is required — every trade needs a take profit")
-        if req.sl is None or req.sl == 0:
-            raise HTTPException(400, "SL is required — every trade needs a stop loss")
+        if not req.pending_tp:
+            if not req.tp or all(t == 0 for t in req.tp):
+                raise HTTPException(400, "TP is required — every trade needs a take profit")
+            if req.sl is None or req.sl == 0:
+                raise HTTPException(400, "SL is required — every trade needs a stop loss")
 
         # Global trade cap (safety net)
         if len(iterate_safe(mt5.positions_get())) >= MAX_GLOBAL_TRADES:
@@ -318,6 +321,17 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
                     entry = price
                     log.info("entry=%.2f is <20 pips from market=%.2f — MARKET at %.2f",
                              req.entry, price, price)
+
+        # --- Auto-generate temp SL/TP for pending_tp signals (StarFx, XAUUSD buy now) ---
+        if req.pending_tp:
+            century_pips = 100 * pip_size  # 10.0 for XAUUSD
+            if req.sl is None or req.sl == 0:
+                req.sl = round(price - century_pips if req.action == "BUY" else price + century_pips, 2)
+                log.info("pending_tp: auto SL=%.2f (100 pips from price=%.2f)", req.sl, price)
+            if not req.tp or all(t == 0 for t in req.tp):
+                temp_tp = round(price + century_pips if req.action == "BUY" else price - century_pips, 2)
+                req.tp = [temp_tp] * 3  # 3 identical temp TPs for 3 positions
+                log.info("pending_tp: auto TP=%.2f x3 (100 pips from price=%.2f)", temp_tp, price)
 
         # --- SL direction check ---
         if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
@@ -436,7 +450,7 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
     if not matched:
         raise HTTPException(404, "no open position for that signal_id" if not req.comment else "no open position matching that comment")
     out = []
-    for p in matched:
+    for i, p in enumerate(matched):
         if req.op in ("close_all", "close_partial"):
             vol = p.volume if req.op == "close_all" else round(p.volume * (req.value or 50) / 100, 2)
             tick = mt5.symbol_info_tick(p.symbol)
@@ -465,6 +479,18 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
                 })
             else:
                 raise HTTPException(400, "modify_tp requires tp_values")
+        elif req.op == "modify_signal":
+            # StarFx/XAUUSD Phase 2: set SL and distribute TPs across positions
+            new_tps = json.loads(req.tp_values) if req.tp_values else []
+            new_sl = req.value if req.value is not None else p.sl
+            tp = new_tps[i % len(new_tps)] if new_tps else p.tp
+            res = mt5.order_send({
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": p.ticket,
+                "symbol": p.symbol,
+                "sl": new_sl,
+                "tp": tp,
+            })
         else:
             new_sl = p.price_open if req.op == "sl_to_be" else req.value
             res = mt5.order_send({

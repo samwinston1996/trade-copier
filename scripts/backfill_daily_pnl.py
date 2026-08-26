@@ -23,13 +23,16 @@ for d in deals:
     pid = getattr(d, "position_id", 0)
     if not pid:
         continue
+    deal_entry = getattr(d, "entry", 0)  # 0=DEAL_ENTRY_IN, 1=DEAL_ENTRY_OUT
     c = str(d.comment or "")
-    is_exit = c.startswith("[tp") or c.startswith("[sl")
-    if is_exit:
+    reason = getattr(d, "reason", 3)
+    
+    if deal_entry == 1:  # DEAL_ENTRY_OUT — exit deal
+        is_tp = c.startswith("[tp") or reason == 5
         if positions[pid]["exit"] is None or d.time > positions[pid]["exit"]["t"]:
-            positions[pid]["exit"] = {"t": d.time, "pl": d.profit, "tp": c.startswith("[tp")}
+            positions[pid]["exit"] = {"t": d.time, "pl": d.profit, "tp": is_tp}
         positions[pid]["pnl"] += d.profit
-    else:
+    else:  # DEAL_ENTRY_IN — entry deal
         if positions[pid]["entry"] is None:
             positions[pid]["entry"] = {"t": d.time, "com": c[:25]}
             positions[pid]["entry_time"] = d.time

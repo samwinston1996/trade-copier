@@ -35,7 +35,8 @@ def get_router_signals():
           "-1001916021658":"star fx trade","-1002110392082":"XAUUSD ANALYSIS TEAM",
           "-1001777167655":"GOLD_GBP_KILLER","-1001918089511":"Paul GOLD Dominator",
           "-1001519298737":"Ak Capital VIP","-1001327204060":"GOLD PIPS HUNTER",
-          "-1002639766136":"Gold Vision","-1002280058493":"XAUUSD BEST TRADER"}
+          "-1002639766136":"Gold Vision","-1002280058493":"XAUUSD BEST TRADER",
+          "-1002439412709":"Trading Central FX"}
     for line in r.stdout.split('\n'):
         m = re.search(r'(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}),\d{3} INFO parsed (-?\d+):(\d+) -> (\w+) conf=([\d.]+)', line)
         if m:
@@ -67,14 +68,18 @@ entries_list = []
 for d in deals:
     pid = getattr(d, 'position_id', 0)
     if not pid: continue
+    deal_entry = getattr(d, 'entry', 0)  # 0=DEAL_ENTRY_IN, 1=DEAL_ENTRY_OUT
     c = str(d.comment or "")
-    is_exit = c.startswith("[tp") or c.startswith("[sl")
+    reason = getattr(d, 'reason', 3)
     
-    if is_exit:
+    if deal_entry == 1:  # DEAL_ENTRY_OUT — exit deal
         if positions[pid]["exit"] is None or d.time > positions[pid]["exit"]["t"]:
-            positions[pid]["exit"] = {"t": d.time, "sym": d.symbol, "vol": d.volume, "pl": d.profit, "tp": c.startswith("[tp")}
+            # Determine TP/SL from comment or reason
+            is_tp = c.startswith("[tp") or reason == 5  # DEAL_REASON_TP
+            is_sl = c.startswith("[sl") or reason == 4  # DEAL_REASON_SL
+            positions[pid]["exit"] = {"t": d.time, "sym": d.symbol, "vol": d.volume, "pl": d.profit, "tp": is_tp}
         positions[pid]["profit"] += d.profit
-    else:
+    else:  # DEAL_ENTRY_IN — entry deal
         if positions[pid]["entry"] is None:
             positions[pid]["entry"] = {"t": d.time, "sym": d.symbol, "vol": d.volume, "pl": d.profit, "com": c[:25], "typ": d.type}
             positions[pid]["id"] = pid

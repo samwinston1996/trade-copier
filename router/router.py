@@ -32,6 +32,8 @@ IMAGE_CHANNEL_IDS = [int(c.strip()) for c in os.environ.get("IMAGE_CHANNEL_IDS",
 
 # Channel IDs for special handling
 AK_CAPITAL_ID = -1001519298737
+STAR_FX_ID = -1001916021658
+XAUUSD_ANALYSIS_ID = -1002110392082
 
 # ── Prompts ─────────────────────────────────────────────────────
 
@@ -238,6 +240,64 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 "action": "MODIFY", "symbol": "XAUUSD",
                 "manage_op": "sl_to_be",
                 "confidence": 1.0,
+            }
+
+    # — StarFx Phase 2 (full signal): "GOLD BUY NOW 4632-4628📊\n😮SL 4623\n✅TP1 4634\n✅TP2 4638\n✅TP3 4643"
+    if channel_id == STAR_FX_ID:
+        m = re.search(r'GOLD\s+(BUY|SELL)\s+NOW\s+(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)', text, re.I)
+        if m:
+            action = m.group(1).upper()
+            lo, hi = float(m.group(2)), float(m.group(3))
+            entry = round((lo + hi) / 2, 2)
+            sl_m = re.search(r'SL\s+(\d+\.?\d*)', text, re.I)
+            tps = [float(x) for x in re.findall(r'TP\d?\s*(\d+\.?\d*)', text, re.I)]
+            if sl_m and len(tps) >= 3:
+                return {
+                    "action": "MODIFY", "symbol": "XAUUSD",
+                    "manage_op": "modify_signal",
+                    "entry": entry, "sl": float(sl_m.group(1)),
+                    "tp": tps[:3], "confidence": 1.0,
+                    "order_type": "limit",
+                }
+
+        # — StarFx Phase 1 (quick entry): "Gold buy now" or "Gold sell now" (exact, no prices)
+        m = re.search(r'^gold\s+(buy|sell)\s+now$', text, re.I)
+        if m:
+            action = m.group(1).upper()
+            return {
+                "action": action, "symbol": "XAUUSD",
+                "order_type": "market", "entry": None,
+                "sl": None, "tp": [],
+                "confidence": 1.0, "pending_tp": True,
+            }
+
+    # — XAUUSD Analysis Team Phase 2 (full signal): "XAUUSD BUY Signal\nEntry: 4636\nTP1: 4641\nTP2: 4646\nTP3: 4651\nStop Loss: 4626"
+    if channel_id == XAUUSD_ANALYSIS_ID:
+        m = re.search(r'XAUUSD\s+(BUY|SELL)\s+SIGNAL', text, re.I)
+        if m:
+            action = m.group(1).upper()
+            entry_m = re.search(r'Entry:\s*(\d+\.?\d*)', text)
+            sl_m = re.search(r'Stop Loss:\s*(\d+\.?\d*)', text)
+            tps = [float(x) for x in re.findall(r'TP\d:\s*(\d+\.?\d*)', text)]
+            if entry_m and sl_m and len(tps) >= 3:
+                return {
+                    "action": "MODIFY", "symbol": "XAUUSD",
+                    "manage_op": "modify_signal",
+                    "entry": float(entry_m.group(1)),
+                    "sl": float(sl_m.group(1)),
+                    "tp": tps[:3], "confidence": 1.0,
+                    "order_type": "limit",
+                }
+
+        # — XAUUSD Analysis Team Phase 1 (quick entry): "XAUUSD BUY NOW" (exact, no prices)
+        m = re.search(r'^XAUUSD\s+(BUY|SELL)\s+NOW$', text, re.I)
+        if m:
+            action = m.group(1).upper()
+            return {
+                "action": action, "symbol": "XAUUSD",
+                "order_type": "market", "entry": None,
+                "sl": None, "tp": [],
+                "confidence": 1.0, "pending_tp": True,
             }
 
     return None
@@ -536,6 +596,42 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             }
             r = await c.post(f"{BRIDGE_URL}/manage", json=body, headers=headers)
 
+        elif sig.get("manage_op") == "modify_signal":
+            # StarFx/XAUUSD Phase 2: full signal arrived
+            pending = channel_state.current_signal(str(ev.channel_id))
+            title = pending.get("channel_title", ev.channel_title or str(ev.channel_id)) if pending else (ev.channel_title or str(ev.channel_id))
+            
+            if pending and pending.get("pending_tp", False):
+                # Phase 2: modify existing temp trades — set real SL + distribute TPs
+                body = {
+                    "signal_id": f"{ev.channel_id}:{ev.message_id}",
+                    "comment": title,
+                    "op": "modify_signal",
+                    "value": sig.get("sl"),
+                    "tp_values": json.dumps(sig.get("tp", [])),
+                }
+                r = await c.post(f"{BRIDGE_URL}/manage", json=body, headers=headers)
+            else:
+                # No temp trades — open 3 fresh trades with the full signal params
+                log.info("modify_signal without pending_tp — opening 3 fresh trades for %s:%s",
+                         ev.channel_id, ev.message_id)
+                # Determine direction from entry vs SL
+                entry = sig.get("entry")
+                sl = sig.get("sl")
+                if entry is not None and sl is not None:
+                    action = "BUY" if sl < entry else "SELL"
+                body = {
+                    "action": action,
+                    "symbol": "XAUUSD",
+                    "order_type": sig.get("order_type", "limit"),
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": sig.get("tp", []),
+                    "signal_id": f"{ev.channel_id}:{ev.message_id}",
+                    "comment": title,
+                }
+                r = await c.post(f"{BRIDGE_URL}/trade", json=body, headers=headers)
+
         else:
             ref = ev.reply_to_id or ev.message_id
             body = {
@@ -572,6 +668,15 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             current = channel_state.current_signal(str(ev.channel_id))
             if current:
                 current["pending_tp"] = False
+                current["tp"] = sig.get("tp", [])
+                channel_state.update(str(ev.channel_id), current)
+        elif sig.get("manage_op") == "modify_signal":
+            # StarFx/XAUUSD Phase 2 — clear pending_tp, store real values
+            current = channel_state.current_signal(str(ev.channel_id))
+            if current and current.get("pending_tp", False):
+                current["pending_tp"] = False
+                current["entry"] = sig.get("entry")
+                current["sl"] = sig.get("sl")
                 current["tp"] = sig.get("tp", [])
                 channel_state.update(str(ev.channel_id), current)
 
