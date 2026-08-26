@@ -61,8 +61,10 @@ class TradeRequest(BaseModel):
 
 class ManageRequest(BaseModel):
     signal_id: str
-    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl"]
+    comment: Optional[str] = None
+    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp"]
     value: Optional[float] = None
+    tp_values: Optional[str] = None  # JSON array, e.g. "[4655, 4640, 4615]"
 
 
 class CloseChannelRequest(BaseModel):
@@ -420,9 +422,19 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
 def manage(req: ManageRequest, authorization: str = Header(None)):
     auth(authorization)
     mt5 = ensure_mt5()
-    matched = [p for p in (mt5.positions_get() or []) if req.signal_id in p.comment]
+    
+    # Match by comment (channel_title) if provided, otherwise by signal_id
+    if req.comment:
+        comment_key = re.sub(r'[^\x00-\x7F]+', '', sanitize_comment(req.comment)).strip()
+        matched = [
+            p for p in (mt5.positions_get() or [])
+            if comment_key in re.sub(r'[^\x00-\x7F]+', '', sanitize_comment(p.comment or ""))
+        ]
+    else:
+        matched = [p for p in (mt5.positions_get() or []) if req.signal_id in p.comment]
+    
     if not matched:
-        raise HTTPException(404, "no open position for that signal_id")
+        raise HTTPException(404, "no open position for that signal_id" if not req.comment else "no open position matching that comment")
     out = []
     for p in matched:
         if req.op in ("close_all", "close_partial"):
@@ -439,6 +451,20 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
                 "magic": MAGIC,
                 "type_filling": mt5.ORDER_FILLING_FOK,
             })
+        elif req.op == "modify_tp":
+            # AK Capital Phase 2: replace the temp TP with the real TP levels
+            new_tps = json.loads(req.tp_values) if req.tp_values else []
+            if new_tps:
+                # MT5 supports only one TP per position — set to first level
+                res = mt5.order_send({
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": p.ticket,
+                    "symbol": p.symbol,
+                    "sl": p.sl,
+                    "tp": new_tps[0],
+                })
+            else:
+                raise HTTPException(400, "modify_tp requires tp_values")
         else:
             new_sl = p.price_open if req.op == "sl_to_be" else req.value
             res = mt5.order_send({
@@ -448,5 +474,5 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
                 "sl": new_sl,
                 "tp": p.tp,
             })
-        out.append({"ticket": p.ticket, "retcode": res.retcode})
+        out.append({"ticket": p.ticket, "retcode": res.retcode if res else -1})
     return {"status": "done", "results": out}

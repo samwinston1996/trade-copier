@@ -51,6 +51,8 @@ class ChannelState:
                 "tp": signal.get("tp", []),
                 "order_type": signal.get("order_type", "market"),
                 "from_image": signal.get("from_image", False),
+                "pending_tp": signal.get("pending_tp", False),
+                "tickets": signal.get("tickets", []),
                 "timestamp": signal.get("timestamp", ""),
             }
             if signal.get("channel_title"):

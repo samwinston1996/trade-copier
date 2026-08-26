@@ -30,6 +30,9 @@ TEXT_MODEL = os.environ.get("TEXT_MODEL", "deepseek/deepseek-v4-flash")
 VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-3.1-flash-lite-preview")
 IMAGE_CHANNEL_IDS = [int(c.strip()) for c in os.environ.get("IMAGE_CHANNEL_IDS", "").split(",") if c.strip()]
 
+# Channel IDs for special handling
+AK_CAPITAL_ID = -1001519298737
+
 # ── Prompts ─────────────────────────────────────────────────────
 
 TEXT_SYSTEM_PROMPT = """You are a trade-signal parser. Input: a raw Telegram message from a signals channel.
@@ -118,7 +121,7 @@ def extract_json(s: str) -> dict:
 
 # ── Regex pre-filter for known text formats ─────────────────────
 
-def parse_with_regex(text: str) -> dict | None:
+def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
     """Try to parse known text signal formats with regex.
     Returns None if no match — caller should fall back to LLM.
     """
@@ -175,6 +178,67 @@ def parse_with_regex(text: str) -> dict | None:
                 "confidence": 1.0,
             }
         return None  # partial → LLM fallback
+
+    # — AK Capital Pending TP (Phase 1): "xauusd sell 4482-4484 | sl 4492" or "Xauusd sell 4670-72-73 | sl 4681"
+    #   Entry as range, SL present, TP follows in a separate message.
+    if channel_id == AK_CAPITAL_ID:
+        m = re.search(r'xauusd\s+(buy|sell)(?:\s+now)?\s+([\d\-\s]+)\s*\|\s*sl\s+(\d+)', text, re.I)
+        if m:
+            action = m.group(1).upper()
+            prices_str = m.group(2).strip()
+            sl = float(m.group(3))
+            # Parse price range — handles "4482-4484", "4670-72-73", "4583-4584-4586"
+            parts = [p for p in re.split(r'[\-\s]+', prices_str) if p]
+            full_prices = []
+            prefix = None
+            for p in parts:
+                if len(p) >= 4:
+                    full_prices.append(float(p))
+                    prefix = p[:2]
+                elif prefix:
+                    full_prices.append(float(prefix + p))
+            if full_prices:
+                lo, hi = min(full_prices), max(full_prices)
+                entry = round((lo + hi) / 2, 2) if len(full_prices) > 1 else lo
+                # Only handle if TP is NOT already in the message
+                has_tp = bool(re.findall(r'TP\d?:?\s*(\d+\.?\d*)', text, re.I))
+                if not has_tp:
+                    # Use MARKET order — bridge will calculate safe temp TP from actual fill
+                    temp_tp = round(entry - 10.0 if action == "SELL" else entry + 10.0, 2)
+                    return {
+                        "action": action, "symbol": "XAUUSD",
+                        "order_type": "market", "entry": None,
+                        "sl": sl, "tp": [temp_tp],
+                        "confidence": 1.0, "pending_tp": True,
+                    }
+
+        # — AK Capital TP follow-up (Phase 2): "tp1 4455 | tp2 4435" or "tp1 4550 | to2 4535 | target 4520"
+        m = re.search(r'tp1?\s*(\d+\.?\d*)\s*\|\s*t[op]2?\s*(\d+\.?\d*)', text, re.I)
+        if m:
+            tp1 = float(m.group(1))
+            tp2 = float(m.group(2))
+            tps = [tp1, tp2]
+            # Optional third level: "target 4520"
+            t3 = re.search(r'target\s+(\d+\.?\d*)', text, re.I)
+            if t3:
+                tps.append(float(t3.group(1)))
+            return {
+                "action": "MODIFY", "symbol": "XAUUSD",
+                "manage_op": "modify_tp",
+                "tp": tps, "confidence": 1.0,
+            }
+
+        # — AK Capital Breakeven: "set breakeven", "use breakeven", "ser breakeven", "set breakevem"
+        #   Matches actionable instructions (NOT notifications like "breakeven hitttt" or "Breakeven Hit")
+        m = re.search(
+            r'(?:use|set|ser)\s+breakeven', text, re.I
+        )
+        if m:
+            return {
+                "action": "MODIFY", "symbol": "XAUUSD",
+                "manage_op": "sl_to_be",
+                "confidence": 1.0,
+            }
 
     return None
 
@@ -301,7 +365,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             log.info("=== PAUL DEBUG === text=%s", ev.text[:500])
 
         # Try regex pre-filter first (zero LLM cost)
-        sig = parse_with_regex(ev.text)
+        sig = parse_with_regex(ev.text, ev.channel_id)
         if sig:
             log.info("Regex parsed %s:%s -> %s conf=%.2f",
                      ev.channel_id, ev.message_id, sig.get("action", "?"), sig.get("confidence", 0))
@@ -324,10 +388,11 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         return {"status": "ignored", "signal": sig}
 
     if action in ("BUY", "SELL"):
-        if sig.get("sl") is None:
+        is_pending = sig.get("pending_tp", False)
+        if sig.get("sl") is None and not is_pending:
             log.warning("Rejected %s:%s — SL missing, conf=%.2f", ev.channel_id, ev.message_id, conf)
             return {"status": "ignored", "reason": "SL missing from signal"}
-        if conf < 0.5:
+        if conf < 0.5 and not is_pending:
             log.warning("Rejected %s:%s — confidence %.2f below 0.5", ev.channel_id, ev.message_id, conf)
             return {"status": "ignored", "reason": f"confidence {conf:.2f} below 0.5"}
 
@@ -448,6 +513,29 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                          ev.channel_id, ev.message_id,
                          "no tickets returned" if not ticket_ids else "same signal as previous")
 
+        elif sig.get("manage_op") == "modify_tp":
+            # AK Capital Phase 2: modify existing positions' TPs from temp to real
+            pending = channel_state.current_signal(str(ev.channel_id))
+            title = pending.get("channel_title", ev.channel_title or str(ev.channel_id)) if pending else (ev.channel_title or str(ev.channel_id))
+            body = {
+                "signal_id": f"{ev.channel_id}:{ev.message_id}",
+                "comment": title,
+                "op": "modify_tp",
+                "tp_values": json.dumps(sig.get("tp", [])),
+            }
+            r = await c.post(f"{BRIDGE_URL}/manage", json=body, headers=headers)
+
+        elif sig.get("manage_op") == "sl_to_be":
+            # AK Capital Breakeven — move SL to entry price for all AK Capital positions
+            pending = channel_state.current_signal(str(ev.channel_id))
+            title = pending.get("channel_title", ev.channel_title or str(ev.channel_id)) if pending else (ev.channel_title or str(ev.channel_id))
+            body = {
+                "signal_id": f"{ev.channel_id}:{ev.message_id}",
+                "comment": title,
+                "op": "sl_to_be",
+            }
+            r = await c.post(f"{BRIDGE_URL}/manage", json=body, headers=headers)
+
         else:
             ref = ev.reply_to_id or ev.message_id
             body = {
@@ -463,7 +551,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     else:
         await alert(f"Executed {action} {sig.get('symbol', '')}: {r.text[:300]}")
         if action in ("BUY", "SELL"):
-            channel_state.update(str(ev.channel_id), {
+            update = {
                 "msg_id": ev.message_id,
                 "channel_title": ev.channel_title or str(ev.channel_id),
                 "action": action,
@@ -473,6 +561,18 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 "order_type": sig.get("order_type", "market"),
                 "from_image": is_image,
                 "timestamp": ev.date,
-            })
+            }
+            is_pending = sig.get("pending_tp", False)
+            if is_pending:
+                update["pending_tp"] = True
+                update["tickets"] = ticket_ids
+            channel_state.update(str(ev.channel_id), update)
+        elif sig.get("manage_op") == "modify_tp":
+            # Clear pending_tp, store real TP
+            current = channel_state.current_signal(str(ev.channel_id))
+            if current:
+                current["pending_tp"] = False
+                current["tp"] = sig.get("tp", [])
+                channel_state.update(str(ev.channel_id), current)
 
     return {"status": "forwarded", "bridge_status": r.status_code, "bridge_body": r.json()}
