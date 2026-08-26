@@ -128,7 +128,8 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
     Returns None if no match — caller should fall back to LLM.
     """
     # Guard: result/recap messages contain hit/profit keywords — let LLM handle
-    if re.search(r'(HIT|✅|❌|😄|💯|PROFIT)', text):
+    # NOTE: ✅ is NOT blocked — StarFx and XAUUSD use it as a bullet in signal messages
+    if re.search(r'(HIT|❌|😄|💯|PROFIT)', text):
         return None
 
     # — Distinct Forex format: #XAUUSD BUY 4000 \n\n TP 4004 \n TP 4008 ... \n\n SL 3990 —
