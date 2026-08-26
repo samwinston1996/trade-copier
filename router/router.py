@@ -231,7 +231,7 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
         # — AK Capital Breakeven: "set breakeven", "use breakeven", "ser breakeven", "set breakevem"
         #   Matches actionable instructions (NOT notifications like "breakeven hitttt" or "Breakeven Hit")
         m = re.search(
-            r'(?:use|set|ser)\s+breakeven', text, re.I
+            r'(?:use|set|ser)\s+breakeve', text, re.I
         )
         if m:
             return {
