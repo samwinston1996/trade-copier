@@ -231,10 +231,25 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 "tp": tps, "confidence": 1.0,
             }
 
-        # — AK Capital Breakeven: "set breakeven", "use breakeven", "ser breakeven", "set breakevem"
+        # — AK Capital TP follow-up (Phase 2 alt format): no pipe, e.g. "tp1 4595 tp2 4610 target 4635" or "TP 4610 TP 4625"
+        m = re.search(r'(?:^|\btp\b|\btp1\b|\bT\.P\b)\s*:?\s*(\d+\.?\d*)(?:[^\d]*?\btp\s*:?\s*(\d+\.?\d*)|\s*[–\-]\s*(\d+\.?\d*))', text, re.I)
+        if m:
+            tps = [float(x) for x in m.groups() if x is not None][:2]
+            t3 = re.search(r'target\s+(\d+\.?\d*)', text, re.I)
+            if t3:
+                tps.append(float(t3.group(1)))
+            if len(tps) >= 2:
+                return {
+                    "action": "MODIFY", "symbol": "XAUUSD",
+                    "manage_op": "modify_tp",
+                    "tp": tps, "confidence": 1.0,
+                }
+
+        # — AK Capital Breakeven: "set breakeven", "use breakeven", "ser breakeven", "set breakevem",
+        #   "Stop Loss moved to BREAKEVEN", "SL moved to breakeven", "move to breakeven"
         #   Matches actionable instructions (NOT notifications like "breakeven hitttt" or "Breakeven Hit")
         m = re.search(
-            r'(?:use|set|ser)\s+breakeve', text, re.I
+            r'(?:use|set|ser|move[sd]?\s+to|sl\s+to)\s+breakeve', text, re.I
         )
         if m:
             return {
@@ -363,13 +378,16 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     log.info("Webhook: event=%s msg=%s channel=%s req=%s",
              ev.event, ev.message_id, ev.channel_id, ev.request_id)
 
+    # Strip channel_title at source — MT5 rejects comments with trailing whitespace
+    ch_title = (ev.channel_title or "").strip()
+    ch_source = ch_title or ev.channel_id  # non-empty string for comment/ID use
+
     # ===== 1. DELETE EVENT — revert channel state, clean up MT5 =====
     if ev.event == "delete":
         log.info("Delete event: channel=%s msg=%s", ev.channel_id, ev.message_id)
         removed = channel_state.remove_signal_id(str(ev.channel_id), ev.message_id)
         if removed:
-            title = channel_state.get_channel_title(str(ev.channel_id))
-            comment = title or str(ev.channel_id)
+            comment = ch_source
             headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
             async with httpx.AsyncClient(timeout=15) as c:
                 await c.post(
@@ -390,17 +408,17 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         current = channel_state.current_signal(str(ev.channel_id))
         if current and len(current.get("tp", [])) >= 3:
             log.info("TP3 hit for %s:%s — cancelling pending orders for '%s'",
-                     ev.channel_id, ev.message_id, ev.channel_title)
+                     ev.channel_id, ev.message_id, ch_title)
             headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
             async with httpx.AsyncClient(timeout=15) as c:
                 await c.post(
                     f"{BRIDGE_URL}/close_channel",
-                    json={"comment": ev.channel_title or str(ev.channel_id),
+                    json={"comment": ch_title or str(ev.channel_id),
                           "pending_only": True},
                     headers=headers,
                 )
-            await alert(f"TP3 hit — cancelled pending for {ev.channel_title}: {ev.text[:200]}")
-            return {"status": "tp3_hit_cleaned", "channel": ev.channel_title}
+            await alert(f"TP3 hit — cancelled pending for {ch_title}: {ev.text[:200]}")
+            return {"status": "tp3_hit_cleaned", "channel": ch_title}
 
     # ===== 2. ROUTE TO PARSER =====
     is_image = False
@@ -457,6 +475,15 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             log.warning("Rejected %s:%s — confidence %.2f below 0.5", ev.channel_id, ev.message_id, conf)
             return {"status": "ignored", "reason": f"confidence {conf:.2f} below 0.5"}
 
+    # ── Trade.inn: reject promotional/preview messages containing future-tense language ──
+    TRADE_INN_ID = -1001766321748
+    if action in ("BUY", "SELL") and ev.channel_id == TRADE_INN_ID:
+        lower_text = ev.text.lower()
+        if re.search(r'(coming live|coming soon|will discuss|next best|stay tuned|preview)', lower_text):
+            log.info("Rejected %s:%s — Trade.inn promotional/preview text", ev.channel_id, ev.message_id)
+            await alert(f"Trade.inn preview rejected: {action} with promotional text: {ev.text[:120]}")
+            return {"status": "ignored", "reason": "Trade.inn promotional/preview text"}
+
     # ── Reject single-TP signals for Distinct Forex (marketing) ──
     if action in ("BUY", "SELL") and ev.channel_id == -1001547583661:
         tp_list = sig.get("tp", [])
@@ -491,7 +518,22 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                          ev.channel_id, ev.message_id, ev.message_id, current.get("msg_id"))
                 return {"status": "skipped", "reason": f"msg_id {ev.message_id} <= current {current.get('msg_id')} (out of order)"}
 
-            # --- a) Build trade body ---
+            # --- a) Pre-emptively cancel lingering pending orders from previous signals ---
+            # Prevents old pending orders (e.g. BUY LIMIT from 7h ago) from surviving
+            # past a new signal. Runs before the trade is placed to avoid race conditions
+            # with the post-trade close_channel call.
+            if ch_title:
+                try:
+                    await c.post(
+                        f"{BRIDGE_URL}/close_channel",
+                        json={"comment": ch_title, "pending_only": True},
+                        headers=headers, timeout=10,
+                    )
+                    log.info("Pre-emptive pending cancel for '%s' before new signal", ch_title)
+                except Exception as e:
+                    log.warning("Pre-emptive pending cancel failed (non-fatal): %s", e)
+
+            # --- b) Build trade body ---
             raw_tp = sig.get("tp")
             if isinstance(raw_tp, (int, float)):
                 raw_tp = [raw_tp]
@@ -503,8 +545,8 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 "entry": sig.get("entry"),
                 "sl": sig.get("sl"),
                 "tp": raw_tp or [],
-                "signal_id": f"{ev.channel_title or ev.channel_id}:{ev.message_id}",
-                "comment": ev.channel_title or "signal",
+                "signal_id": f"{ch_source}:{ev.message_id}",
+                "comment": ch_title or "signal",
                 "from_image": is_image,
             }
 
@@ -555,7 +597,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                                  prev_action, action, ev.channel_id, ev.message_id)
 
             if should_close:
-                close_body = {"comment": ev.channel_title or "signal"}
+                close_body = {"comment": ch_title or "signal"}
                 close_body["exclude_tickets"] = ticket_ids
                 try:
                     close_resp = await c.post(f"{BRIDGE_URL}/close_channel", json=close_body,
@@ -577,9 +619,9 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         elif sig.get("manage_op") == "modify_tp":
             # AK Capital Phase 2: modify existing positions' TPs from temp to real
             pending = channel_state.current_signal(str(ev.channel_id))
-            title = pending.get("channel_title", ev.channel_title or str(ev.channel_id)) if pending else (ev.channel_title or str(ev.channel_id))
+            title = pending.get("channel_title", ch_source) if pending else ch_source
             body = {
-                "signal_id": f"{ev.channel_id}:{ev.message_id}",
+                "signal_id": f"{ch_source}:{ev.message_id}",
                 "comment": title,
                 "op": "modify_tp",
                 "tp_values": json.dumps(sig.get("tp", [])),
@@ -589,9 +631,9 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         elif sig.get("manage_op") == "sl_to_be":
             # AK Capital Breakeven — move SL to entry price for all AK Capital positions
             pending = channel_state.current_signal(str(ev.channel_id))
-            title = pending.get("channel_title", ev.channel_title or str(ev.channel_id)) if pending else (ev.channel_title or str(ev.channel_id))
+            title = pending.get("channel_title", ch_source) if pending else ch_source
             body = {
-                "signal_id": f"{ev.channel_id}:{ev.message_id}",
+                "signal_id": f"{ch_source}:{ev.message_id}",
                 "comment": title,
                 "op": "sl_to_be",
             }
@@ -600,7 +642,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         elif sig.get("manage_op") == "modify_signal":
             # StarFx/XAUUSD Phase 2: full signal arrived
             pending = channel_state.current_signal(str(ev.channel_id))
-            title = pending.get("channel_title", ev.channel_title or str(ev.channel_id)) if pending else (ev.channel_title or str(ev.channel_id))
+            title = pending.get("channel_title", ch_source) if pending else ch_source
             
             if pending and pending.get("pending_tp", False):
                 # Phase 2: modify existing temp trades — set real SL + distribute TPs
@@ -650,7 +692,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         if action in ("BUY", "SELL"):
             update = {
                 "msg_id": ev.message_id,
-                "channel_title": ev.channel_title or str(ev.channel_id),
+                "channel_title": ch_title or str(ev.channel_id),
                 "action": action,
                 "entry": sig.get("entry"),
                 "sl": sig.get("sl"),

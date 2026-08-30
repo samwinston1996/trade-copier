@@ -35,10 +35,17 @@ PIP_SIZES = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
 
 
 def sanitize_comment(comment: str) -> str:
-    """Normalize Unicode bold/italic chars to plain ASCII for MT5 compatibility."""
+    """Normalize Unicode bold/italic chars to plain ASCII for MT5 compatibility.
+    Also strip trailing whitespace, replace pipe characters, collapse multiple
+    spaces, and remove hyphens surrounded by spaces (MT5 rejects ' - ' at 30 chars)."""
     if not comment:
         return comment
-    return unicodedata.normalize("NFKC", comment).strip()
+    s = unicodedata.normalize("NFKC", comment).strip().replace("|", "-")
+    # MT5's comment limit is 30 chars — collapse space-hyphen-space sequences
+    s = s.replace(" - ", " ")
+    # Collapse multiple consecutive spaces into one
+    s = " ".join(s.split())
+    return s
 
 
 app = FastAPI(title="MT5 Bridge")
@@ -370,7 +377,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
                 "tp": tp,
                 "deviation": 20,
                 "magic": MAGIC,
-                "comment": sanitize_comment(req.comment)[:31],
+                "comment": sanitize_comment(req.comment)[:30],
                 "type_time": mt5.ORDER_TIME_GTC,
             }
             if is_market:
