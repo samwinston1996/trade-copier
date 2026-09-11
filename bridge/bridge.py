@@ -71,7 +71,7 @@ class TradeRequest(BaseModel):
 class ManageRequest(BaseModel):
     signal_id: str
     comment: Optional[str] = None
-    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp", "modify_signal"]
+    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp", "modify_signal", "close_and_be"]
     value: Optional[float] = None
     tp_values: Optional[str] = None  # JSON array, e.g. "[4655, 4640, 4615]"
 
@@ -518,6 +518,31 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
                 "sl": new_sl,
                 "tp": tp,
             })
+        elif req.op == "close_and_be":
+            # Close 50% of each position, then move remaining SL to entry (breakeven)
+            vol_50 = round(p.volume * 0.5, 2)
+            tick = mt5.symbol_info_tick(p.symbol)
+            res = mt5.order_send({
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": p.symbol,
+                "volume": vol_50,
+                "position": p.ticket,
+                "type": mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "price": tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask,
+                "deviation": 20,
+                "magic": MAGIC,
+                "type_filling": mt5.ORDER_FILLING_FOK,
+            })
+            # Modify remaining position's SL to entry (breakeven)
+            res2 = mt5.order_send({
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": p.ticket,
+                "symbol": p.symbol,
+                "sl": p.price_open,
+                "tp": p.tp,
+            })
+            out.append({"ticket": p.ticket, "close_retcode": res.retcode if res else -1, "modify_retcode": res2.retcode if res2 else -1})
+            continue
         else:
             new_sl = p.price_open if req.op == "sl_to_be" else req.value
             res = mt5.order_send({

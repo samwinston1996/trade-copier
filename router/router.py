@@ -41,13 +41,14 @@ TEXT_SYSTEM_PROMPT = """You are a trade-signal parser. Input: a raw Telegram mes
 Output: ONLY a single JSON object, no prose, no markdown fences.
 Schema:
 {"action":"BUY|SELL|CLOSE|MODIFY|IGNORE","symbol":"...","order_type":"market|limit|stop",
- "entry":number|null,"sl":number|null,"tp":[numbers],"manage_op":"close_all|close_partial|sl_to_be|modify_sl"|null,
+ "entry":number|null,"sl":number|null,"tp":[numbers],"manage_op":"close_all|close_partial|close_and_be|sl_to_be|modify_sl"|null,
  "partial_pct":number|null,"confidence":0.0-1.0}
 Rules:
 - Normalize symbols: GOLD/XAU -> XAUUSD, DOW -> US30, NAS -> NAS100. Uppercase.
 - Commentary, recaps, ads, results screenshots, greetings, "Good morning", "XAU/USD ANALYSIS", market views -> action IGNORE.
 - NEVER invent prices. If SL or TP is missing for BUY/SELL, set confidence <= 0.3.
 - "close", "take profit now", "secure partials", "SL to breakeven", "move SL to X" -> CLOSE or MODIFY with manage_op.
+- BREAKEVEN DETECTION: Messages like "set breakeven", "use breakeven", "move SL to breakeven", "secure your profit & move SL to BE", "secure X% profits by closing partial", "book profit", "move to breakeven" → action=MODIFY, manage_op="close_and_be", partial_pct=50. This books 50% profit and moves remaining SL to entry.
 - Common signal format: "Entry: X", "Stop Loss: X" (or "SL: X"), "TP1: X" (or "Target: X", "TP: X"). Parse these correctly.
 - Handle emoji-prefixed fields: "💎TP¹ 4092" → TP=4092, "#⃣SL 4073" → SL=4073, "💻XAUUSD BUY 4088" → BUY entry=4088
 - For structured text signals with labeled fields (Entry:, Stop Loss:, TP:), extract the exact numbers after each label.
@@ -183,6 +184,16 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 }
             return None  # partial → LLM fallback
 
+        # — Paul GOLD Breakeven: "set breakeven to minimize risk"
+        m = re.search(r'set breakeven to minimize risk', text, re.I)
+        if m:
+            return {
+                "action": "MODIFY", "symbol": "XAUUSD",
+                "manage_op": "close_and_be",
+                "partial_pct": 50,
+                "confidence": 1.0,
+            }
+
     # — AK Capital Pending TP (Phase 1): "xauusd sell 4482-4484 | sl 4492" or "Xauusd sell 4670-72-73 | sl 4681"
     #   Entry as range, SL present, TP follows in a separate message.
     if channel_id == AK_CAPITAL_ID:
@@ -278,13 +289,17 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
         # — AK Capital Breakeven: "set breakeven", "use breakeven", "ser breakeven", "set breakevem",
         #   "Stop Loss moved to BREAKEVEN", "SL moved to breakeven", "move to breakeven"
         #   Matches actionable instructions (NOT notifications like "breakeven hitttt" or "Breakeven Hit")
+        #   Excludes "not set breakeven" (past-tense advisory, not an instruction)
+        if re.search(r'not\s+set\s+breakeve', text, re.I):
+            return None
         m = re.search(
             r'(?:use|set|ser|move[sd]?\s+to|sl\s+to)\s+breakeve', text, re.I
         )
         if m:
             return {
                 "action": "MODIFY", "symbol": "XAUUSD",
-                "manage_op": "sl_to_be",
+                "manage_op": "close_and_be",
+                "partial_pct": 50,
                 "confidence": 1.0,
             }
 
@@ -317,6 +332,16 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 "confidence": 1.0, "pending_tp": True,
             }
 
+        # — StarFx Breakeven: "Secure your profit & move SLto BE"
+        m = re.search(r'(?:Secure your profit|move SLto BE)', text, re.I)
+        if m:
+            return {
+                "action": "MODIFY", "symbol": "XAUUSD",
+                "manage_op": "close_and_be",
+                "partial_pct": 50,
+                "confidence": 1.0,
+            }
+
     # — XAUUSD Analysis Team Phase 2 (full signal): "XAUUSD BUY Signal\nEntry: 4636\nTP1: 4641\nTP2: 4646\nTP3: 4651\nStop Loss: 4626"
     if channel_id == XAUUSD_ANALYSIS_ID:
         m = re.search(r'XAUUSD\s+(BUY|SELL)\s+SIGNAL', text, re.I)
@@ -344,6 +369,17 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 "order_type": "market", "entry": None,
                 "sl": None, "tp": [],
                 "confidence": 1.0, "pending_tp": True,
+            }
+
+    # — Trading Central Breakeven: "secure 30% profits by closing partial lotsize" or "First take profit target is hit" + partial close
+    if channel_id == -1002439412709:
+        m = re.search(r'secure.*?(?:\d+)%.*?profit.*?clos', text, re.I)
+        if m:
+            return {
+                "action": "MODIFY", "symbol": "XAUUSD",
+                "manage_op": "close_and_be",
+                "partial_pct": 50,
+                "confidence": 1.0,
             }
 
     return None
@@ -705,6 +741,18 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                     "comment": title,
                 }
                 r = await c.post(f"{BRIDGE_URL}/trade", json=body, headers=headers)
+
+        elif sig.get("manage_op") == "close_and_be":
+            # Book 50% profit + move remaining SL to breakeven
+            pending = channel_state.current_signal(str(ev.channel_id))
+            title = pending.get("channel_title", ch_source) if pending else ch_source
+            body = {
+                "signal_id": f"{ch_source}:{ev.message_id}",
+                "comment": title,
+                "op": "close_and_be",
+                "value": sig.get("partial_pct", 50),
+            }
+            r = await c.post(f"{BRIDGE_URL}/manage", json=body, headers=headers)
 
         else:
             ref = ev.reply_to_id or ev.message_id
