@@ -166,26 +166,27 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
         return None  # partial match — let LLM fallback handle
 
     # — Paul GOLD Dominator: "Gold Sell Now @ 4377 - 4385 / SL: 4387 / TP1: 4367 / TP2: 4357" —
-    m = re.search(r'(?:Gold\s+)?(?:Sell|Buy)\s+Now\s*@\s*(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)', text, re.I)
-    if m:
-        lo, hi = float(m.group(1)), float(m.group(2))
-        entry = round((lo + hi) / 2, 2)  # midpoint — deterministic
-        sl_m = re.search(r'SL:?\s*(\d+\.?\d*)', text)
-        tps = [float(x) for x in re.findall(r'TP\d?:?\s*(\d+\.?\d*)', text)]
-        if sl_m and tps:
-            action = "SELL" if re.search(r'Sell', text, re.I) else "BUY"
-            return {
-                "action": action, "symbol": "XAUUSD",
-                "order_type": "limit", "entry": entry,
-                "sl": float(sl_m.group(1)), "tp": tps,
-                "confidence": 1.0,
-            }
-        return None  # partial → LLM fallback
+    if channel_id == -1001918089511:
+        m = re.search(r'(?:Gold\s+)?(?:Sell|Buy)\s+Now\s*@\s*(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)', text, re.I)
+        if m:
+            lo, hi = float(m.group(1)), float(m.group(2))
+            entry = round((lo + hi) / 2, 2)  # midpoint — deterministic
+            sl_m = re.search(r'SL:?\s*(\d+\.?\d*)', text)
+            tps = [float(x) for x in re.findall(r'TP\d?:?\s*(\d+\.?\d*)', text)]
+            if sl_m and tps:
+                action = "SELL" if re.search(r'Sell', text, re.I) else "BUY"
+                return {
+                    "action": action, "symbol": "XAUUSD",
+                    "order_type": "limit", "entry": entry,
+                    "sl": float(sl_m.group(1)), "tp": tps,
+                    "confidence": 1.0,
+                }
+            return None  # partial → LLM fallback
 
     # — AK Capital Pending TP (Phase 1): "xauusd sell 4482-4484 | sl 4492" or "Xauusd sell 4670-72-73 | sl 4681"
     #   Entry as range, SL present, TP follows in a separate message.
     if channel_id == AK_CAPITAL_ID:
-        m = re.search(r'xauusd\s+(buy|sell)(?:\s+now)?\s+([\d\-\s]+)\s*\|\s*sl\s+(\d+)', text, re.I)
+        m = re.search(r'xauusd\s+(buy|sell)(?:\s+now)?\s+([\d\-\s]+)\s*(?:\||\n)\s*sl\s+(\d+)', text, re.I)
         if m:
             action = m.group(1).upper()
             prices_str = m.group(2).strip()
