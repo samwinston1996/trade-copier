@@ -344,6 +344,15 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
         if (req.action == "BUY" and req.sl >= entry) or (req.action == "SELL" and req.sl <= entry):
             raise HTTPException(400, "SL on wrong side of entry — bad parse or bad signal")
 
+        # --- TP direction validation ---
+        if req.tp:
+            if req.action == "BUY":
+                req.tp = sorted([t for t in req.tp if t > entry])
+            else:  # SELL
+                req.tp = sorted([t for t in req.tp if t < entry], reverse=True)
+            if not req.tp:
+                raise HTTPException(400, "all TPs on wrong side of entry for " + req.action)
+
         # --- Stale signal check ---
         if req.order_type == "market" and req.entry and abs(price - req.entry) / price > 0.005:
             raise HTTPException(400, "market moved >0.5% since signal — rejected (stale)")
@@ -476,7 +485,13 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
             # AK Capital Phase 2: replace the temp TP with the real TP levels
             new_tps = json.loads(req.tp_values) if req.tp_values else []
             if new_tps:
-                # MT5 supports only one TP per position — set to first level
+                # MT5 supports only one TP per position — use first level on correct side
+                if p.type == mt5.POSITION_TYPE_BUY:
+                    new_tps = sorted([t for t in new_tps if t > p.price_open])
+                else:
+                    new_tps = sorted([t for t in new_tps if t < p.price_open], reverse=True)
+                if not new_tps:
+                    raise HTTPException(400, f"modify_tp: all TPs on wrong side for ticket {p.ticket}")
                 res = mt5.order_send({
                     "action": mt5.TRADE_ACTION_SLTP,
                     "position": p.ticket,
@@ -491,6 +506,11 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
             new_tps = json.loads(req.tp_values) if req.tp_values else []
             new_sl = req.value if req.value is not None else p.sl
             tp = new_tps[i % len(new_tps)] if new_tps else p.tp
+            if tp:
+                if p.type == mt5.POSITION_TYPE_BUY:
+                    tp = tp if tp > p.price_open else p.tp
+                else:
+                    tp = tp if tp < p.price_open else p.tp
             res = mt5.order_send({
                 "action": mt5.TRADE_ACTION_SLTP,
                 "position": p.ticket,

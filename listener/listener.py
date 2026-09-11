@@ -153,19 +153,35 @@ async def make_payload(event, kind: str) -> dict:
 
 
 async def make_payload_from_msg(msg, channel_id: int, kind: str) -> dict:
-    """Build payload from a Telethon Message object (for polling fallback)."""
+    """Build payload from a Telethon Message object (for polling fallback).
+    
+    Telethon's get_messages(limit=1) intermittently returns msg.message = ''
+    for messages with media even when a text caption exists. When the message
+    has media and the text is empty, re-fetch by ID to hydrate the caption.
+    """
     try:
         chat = await client.get_entity(channel_id)
         chat_title = chat.title if hasattr(chat, "title") else ""
     except Exception:
         chat_title = ""
+    # Hydrate caption: if msg has media but empty text, re-fetch by ID
+    text = msg.message or ""
+    if not text.strip() and msg.media is not None:
+        try:
+            entity = await client.get_entity(channel_id)
+            hydrated = await client.get_messages(entity, ids=msg.id)
+            if hydrated and hydrated.message:
+                text = hydrated.message
+                log.info("Hydrated caption for msg %s: %.80r", msg.id, text)
+        except Exception as e:
+            log.debug("Caption re-fetch failed for msg %s: %s", msg.id, e)
     payload = {
         "event": kind,
         "channel_id": channel_id,
         "channel_title": chat_title,
         "message_id": msg.id,
         "reply_to_id": msg.reply_to_msg_id,
-        "text": msg.message or "",
+        "text": text,
         "has_media": msg.media is not None,
         "date": msg.date.isoformat(),
     }

@@ -136,3 +136,42 @@ All sensitive config is managed via `.env` (never committed).
 | `ALERT_BOT_TOKEN` | — | Telegram bot token for alerts |
 | `ALERT_CHAT_ID` | — | Chat ID for alert delivery |
 | `RISK_PERCENT` | `1.0` | Risk per trade (bridge) |
+
+---
+
+## Features Added
+
+Versioned capability releases, in chronological order of deployment.
+
+### V1.0 — Core Dual-Parser Pipeline
+Dual AI parsing: DeepSeek V4 Flash for text signals, Gemini Flash Lite for chart images. Market-aware order placement (LIMIT / STOP / MARKET via 20-pip rule), step lot sizing from balance, SL/TP enforcement, FOK execution, fresh MT5 connection per trade with rpyc-safe iteration. — *Commits `989a445`, `946f40c`, `181cb04`, `3e59949`, `c5fdee5`, `7e73f16`, `adcfe08`, `991105b`, `d52c37e`, `d1c0768`*
+
+### V1.1 — Image Signal Parsing
+Zone-based chart parsing reading entry/SL/TP from coloured zones and right-panel price boxes. 100-pip safety TP prepended to image signals, 50-pip minimum SL guard (filters results screenshots), per-channel `IMAGE_CHANNEL_IDS` separation so image channels and text-only channels route differently. — *Commits `38d97b7`, `1df8b0f`*
+
+### V1.2 — Per-Channel State Machine + Zero-LLM Regex Pre-Filter
+Each channel tracks current + previous signal (entry, SL, TP array, order type, msg_id). Delete events revert state and trigger MT5 cleanup. Regex pre-filter parses known formats (Distinct Forex, BotX, structured Entry:/SL:/TP:) at zero LLM cost; partial matches fall through to the LLM. Out-of-order signals (msg_id ≤ current) rejected at router level. — *Commits `51d184d`, `42b1a2b`*
+
+### V1.3 — Position Integrity Guards + TP3 Auto-Cleanup
+`exclude_tickets` on trade rotation prevents self-cancellation of fresh orders. Atomic duplicate detection (`executed_signals` set + lock). TP3-hit announcement regex (`TP3 HIT`, typo variants `HlT`/`H1T`) auto-cancels pending orders via `pending_only` mode, leaving profitable open positions untouched. — *Commits `be48777`, `51d184d`, `6d03bca`*
+
+### V1.4 — Emoji-Safe Cross-Channel Matching + MT5 Comment Compatibility
+Channel names with emoji (💯, 👑) and Unicode formatting handled reliably across the pipeline. ASCII-stripped comparison keys for comment matching. Handles OctaFX 16-char comment truncation via bidirectional match, NFKC comment sanitization, pipe/special-char stripping (MT5 rejects them), 30-char comment limit. — *Commits `a4a537b`, `6531d97`, `6493635`, `0dd3e68`*
+
+### V1.5 — Self-Healing Listener + Order Safety
+4-hour cron restart prevents Telethon subscription fade. msg_id monotonicity guard, daily-loss-cap removal, `close_channel` fixes (direct cancel, positions_get retry, delete-event date field). — *Commits `069b07c`, `f55c261`*
+
+### V1.6 — Delivery Reliability: Multi-Worker Router + Request Tracing
+Per-push httpx client with `request_id` for end-to-end traceability. Router upgraded to `--workers 4 --http h11` eliminating single-worker starvation (phantom 200s silently dropping signals). Listener validates response body on push and retries on unexpected status instead of trusting a bare 200. — *Commits `7cebedc`, `283dc87`*
+
+### V1.7 — AK Capital Two-Phase TP + Breakeven
+AK Capital VIP signals execute as market orders with a provisional 100-pip temp TP. Follow-up TP messages (`tp1 X | tp2 Y ...`) modify existing positions to real TP levels via bridge `/manage` `modify_tp`. Breakeven management (`use breakeven`, `set breakevem` typo variants) via `sl_to_be`. — *Commits `2041ec6`, `4eea9c2`*
+
+### V1.8 — Buy Now/Sell Now Instant Execution (StarFx/XAUUSD/BEST TRADER) + Trading Central
+Selected channels: `buy now / sell now` messages open 3 market orders immediately with temp SL + 100-pip TP (`pending_tp` state, tickets tracked per channel). When the group shares the full signal, `modify_signal` distributes real TP levels + updates SL across the open trades. Added Trading Central FX | Elite VIP channel. — *Commit `0554bcb`*
+
+### V1.9 — Signal-Text Hygiene Bundle
+Six pipeline fixes: trailing-space strip at source, pipe→hyphen conversion, 30-char MT5 comment cap, AK Capital TP alt regex, AK breakeven widened match, pre-emptive pending cancel before new signals, Trade.inn promotional-message filter, `✅` removed from regex guard. — *Commits `f2149f9`, `3a64dff`*
+
+### V2.0 — Photo Caption Hydration + TP Direction Validation
+**Root-cause fix for Paul GOLD Dominator + Trade.inn + XAU/USD Analysis signal drops.** Messages posted with photo + text caption arrived at the router with empty text because Telethon's `get_messages(limit=1)` intermittently omits the caption field for media messages. Listener now re-fetches by message ID to hydrate the caption before pushing. Bridge now validates TP direction per trade side (BUY → TPs above entry, SELL → TPs below), filtering invalid TPs instead of returning MT5 retcode 10016 / 500s. — *Current release*
