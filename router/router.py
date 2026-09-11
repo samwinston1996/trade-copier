@@ -545,6 +545,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 "entry": sig.get("entry"),
                 "sl": sig.get("sl"),
                 "tp": raw_tp or [],
+                "pending_tp": sig.get("pending_tp", False),
                 "signal_id": f"{ch_source}:{ev.message_id}",
                 "comment": ch_title or "signal",
                 "from_image": is_image,

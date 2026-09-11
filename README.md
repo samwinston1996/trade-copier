@@ -167,8 +167,8 @@ Per-push httpx client with `request_id` for end-to-end traceability. Router upgr
 ### V1.7 — AK Capital Two-Phase TP + Breakeven
 AK Capital VIP signals execute as market orders with a provisional 100-pip temp TP. Follow-up TP messages (`tp1 X | tp2 Y ...`) modify existing positions to real TP levels via bridge `/manage` `modify_tp`. Breakeven management (`use breakeven`, `set breakevem` typo variants) via `sl_to_be`. — *Commits `2041ec6`, `4eea9c2`*
 
-### V1.8 — Buy Now/Sell Now Instant Execution (StarFx/XAUUSD/BEST TRADER) + Trading Central
-Selected channels: `buy now / sell now` messages open 3 market orders immediately with temp SL + 100-pip TP (`pending_tp` state, tickets tracked per channel). When the group shares the full signal, `modify_signal` distributes real TP levels + updates SL across the open trades. Added Trading Central FX | Elite VIP channel. — *Commit `0554bcb`*
+### V1.8 — Buy Now/Sell Now Instant Execution (star fx + XAU/USD Analysis Team + AK Capital)
+**Three channels** wired for instant pending_tp execution. star fx (`Gold buy now` / `Gold sell now`) and XAU/USD Analysis Team (`XAUUSD BUY NOW` / `XAUUSD SELL NOW`) open 3 market orders with auto temp SL/TP. When the group shares the full signal, `modify_signal` distributes real TP levels + updates SL across the open trades. AK Capital range-entry signals (`xauusd sell 4482-4484 | sl 4492`) use `modify_tp` follow-up for Phase 2 TP distribution. Added Trading Central FX | Elite VIP as a monitored channel (text/LLM parsing, no special buy now/sell now logic). — *Commit `0554bcb`*
 
 ### V1.9 — Signal-Text Hygiene Bundle
 Six pipeline fixes: trailing-space strip at source, pipe→hyphen conversion, 30-char MT5 comment cap, AK Capital TP alt regex, AK breakeven widened match, pre-emptive pending cancel before new signals, Trade.inn promotional-message filter, `✅` removed from regex guard. — *Commits `f2149f9`, `3a64dff`*
