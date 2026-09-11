@@ -199,6 +199,10 @@ async def poll_channels():
     Runs alongside the event handlers. Only pushes messages that:
     - Have a higher msg_id than the last known (prevents re-pushing old messages)
     - Are NOT already in last_pushed (prevents duplicating event handler's work)
+    
+    When the polling detects a gap between last_known and the latest message,
+    it fetches ALL missed messages in between — not just the latest — so that
+    signals posted between polling cycles are not silently skipped.
     """
     while True:
         await asyncio.sleep(POLL_INTERVAL)
@@ -214,7 +218,32 @@ async def poll_channels():
                 if latest.id <= last_known:
                     continue  # no new messages
 
-                # Check if event handler already pushed this (debounce protection)
+                # — Gap catch-up: fetch ALL missed messages between last_known and latest —
+                missed = []
+                if latest.id > last_known + 1:
+                    gap_msgs = await client.get_messages(
+                        entity, min_id=last_known, max_id=latest.id, limit=50
+                    )
+                    # Reverse to ascending order (Telethon returns newest-first)
+                    gap_msgs.reverse()
+                    for gm in gap_msgs:
+                        key = (channel_id, gm.id)
+                        if key not in last_pushed and gm.id > last_known:
+                            missed.append(gm)
+                    if missed:
+                        log.info("Polling caught %d missed messages in channel %s gap [%s..%s]",
+                                 len(missed), channel_id, last_known + 1, latest.id)
+
+                # Process missed messages first (oldest to newest)
+                for gm in missed:
+                    key = (channel_id, gm.id)
+                    payload = await make_payload_from_msg(gm, channel_id, "new")
+                    if await push(payload):
+                        last_pushed[key] = (hash(gm.message or ""), time.time())
+                        last_polled_msg_id[channel_id] = gm.id
+                        save_poll_state(last_polled_msg_id)
+
+                # Process the latest message (skip if already handled by event handler)
                 key = (channel_id, latest.id)
                 if key in last_pushed:
                     # Event handler already processed — just update poll tracker
