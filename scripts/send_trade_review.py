@@ -31,11 +31,11 @@ today_date = datetime.fromtimestamp(today_start_utc, tz=IST).strftime("%Y-%m-%d"
 def get_router_signals():
     r = subprocess.run("docker logs router --tail 5000 2>&1", shell=True, capture_output=True, text=True, timeout=15)
     sigs = []
-    cm = {"-1002045136062":"BotX channel","-1001766321748":"Trade.inn FOREX",
-          "-1001916021658":"star fx trade","-1002110392082":"XAUUSD ANALYSIS TEAM",
+    cm = {"-1002045136062":"BotX channel","-1001766321748":"Trade.inn FOREX 💯",
+          "-1001916021658":"star fx","-1002110392082":"XAU/USD ANALYSIS TEAM",
           "-1001777167655":"GOLD_GBP_KILLER","-1001918089511":"Paul GOLD Dominator",
-          "-1001519298737":"Ak Capital VIP","-1001327204060":"GOLD PIPS HUNTER",
-          "-1002639766136":"Gold Vision","-1002280058493":"XAUUSD BEST TRADER",
+          "-1001519298737":"Ak Capital VIP 👑","-1001327204060":"GOLD PIPS HUNTER",
+          "-1002280058493":"XAUUSD BEST TRADER",
           "-1002439412709":"Trading Central FX"}
     for line in r.stdout.split('\n'):
         m = re.search(r'(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}),\d{3} INFO parsed (-?\d+):(\d+) -> (\w+) conf=([\d.]+)', line)
@@ -49,6 +49,31 @@ def get_router_signals():
             if ts.timestamp() < today_start_utc: continue
             sigs.append({"ts":ts.timestamp(),"ch":cm.get(m2.group(3),m2.group(3)),"action":"TP3_HIT"})
     return sigs
+
+# ── Channel name normalization ──
+# Telegram channels sometimes rename. MT5 stores the title-at-open-time as comment.
+# This map consolidates old titles to canonical current titles so a renamed channel
+# appears as one consistent entry in the daily performance table.
+TITLE_NORMALIZE = {
+    "star fx trade": "star fx",
+    "star fx": "star fx",
+    "ak capital vip =": "Ak Capital VIP 👑",
+    "ak capital vip 👑": "Ak Capital VIP 👑",
+    "ak capital vip": "Ak Capital VIP 👑",
+    "trade.inn forex ": "Trade.inn FOREX 💯",
+    "trade.inn forex 💯": "Trade.inn FOREX 💯",
+    "xau/usd analysis": "XAU/USD ANALYSIS TEAM",
+    "xau/usd analysis team": "XAU/USD ANALYSIS TEAM",
+    "xauusd best trad": "XAUUSD BEST TRADER",
+    "xauusd best trader": "XAUUSD BEST TRADER",
+    "paul gold domina": "Paul GOLD Dominator",
+    "paul gold dominator": "Paul GOLD Dominator",
+}
+
+def normalize_channel(comment: str) -> str:
+    """Normalize MT5 comment to canonical channel name."""
+    key = comment.strip().lower()
+    return TITLE_NORMALIZE.get(key, comment.strip())
 
 router_signals = get_router_signals()
 
@@ -103,12 +128,19 @@ for i, p in enumerate(all_pos):
             batch.append(all_pos[j]); used.add(j)
     if batch: batches.append(batch)
 
+# ── Label orphan batches (empty comment) as Manual trades ──
+# Positions with no MT5 comment are manually traded, not from any channel signal.
+for b in batches:
+    if not b[0]["entry"]["com"]:
+        b[0]["entry"]["com"] = "Manual"
+
 # ── Telegram time lookup ──
 def find_tg(ch, entry_t):
     best, bg = None, 999
     for rs in router_signals:
         if rs["action"] in ("TP3_HIT","IGNORE"): continue
-        if rs["ch"].startswith(ch) or ch.startswith(rs["ch"]):
+        # Exact match since both sides use canonical names (normalization + cm dict)
+        if rs["ch"] == ch or ch.startswith(rs["ch"]) or rs["ch"].startswith(ch):
             g = abs(rs["ts"] - entry_t)
             if g < 300 and g < bg: bg, best = g, rs
     return best
@@ -119,7 +151,8 @@ ch_stats = defaultdict(lambda: {"n":0,"tp":0,"sl":0,"pnl":0.0})
 exit_positions_used = set()
 
 for batch in batches:
-    ch = batch[0]["entry"]["com"] or batch[0]["entry"]["sym"]
+    raw_ch = batch[0]["entry"]["com"] or batch[0]["entry"]["sym"]
+    ch = normalize_channel(raw_ch)
     direction = "BUY" if batch[0]["entry"]["typ"]==0 else "SELL"
     sym = batch[0]["entry"]["sym"]
     vol = sum(p["entry"]["vol"] for p in batch)
