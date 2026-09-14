@@ -35,12 +35,14 @@ PIP_SIZES = {"XAUUSD": 0.10, "US30": 1.0, "NAS100": 1.0}
 
 
 def sanitize_comment(comment: str) -> str:
-    """Normalize Unicode bold/italic chars to plain ASCII for MT5 compatibility.
-    Also strip trailing whitespace, replace pipe characters, collapse multiple
-    spaces, and remove hyphens surrounded by spaces (MT5 rejects ' - ' at 30 chars)."""
+    """Sanitize comment for MT5 compatibility. Strips trailing whitespace,
+    non-ASCII characters (MT5 rejects them), and pipe chars. Collapses
+    space-hyphen-space sequences and multiple spaces to fit 30-char limit."""
     if not comment:
         return comment
     s = unicodedata.normalize("NFKC", comment).strip().replace("|", "-")
+    # MT5 rejects non-ASCII chars in comment field
+    s = re.sub(r'[^\x00-\x7F]+', '', s)
     # MT5's comment limit is 30 chars — collapse space-hyphen-space sequences
     s = s.replace(" - ", " ")
     # Collapse multiple consecutive spaces into one
