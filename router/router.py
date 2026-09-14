@@ -321,8 +321,8 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                     "order_type": "limit",
                 }
 
-        # — StarFx Phase 1 (quick entry): "Gold buy now" or "Gold sell now" (exact, no prices)
-        m = re.search(r'^gold\s+(buy|sell)\s+now$', text, re.I)
+        # — StarFx Phase 1 (quick entry): "Gold buy now" or "Gold sell now" (exact or with entry price)
+        m = re.search(r'^gold\s+(buy|sell)\s+now(?:\s*@\s*\d+\.?\d*)?\s*$', text, re.I)
         if m:
             action = m.group(1).upper()
             return {
@@ -473,17 +473,25 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if ev.text and TP3_HIT_PATTERN.search(ev.text):
         current = channel_state.current_signal(str(ev.channel_id))
         if current and len(current.get("tp", [])) >= 3:
-            log.info("TP3 hit for %s:%s — cancelling pending orders for '%s'",
+            log.info("TP3 hit for %s:%s — closing positions and cancelling pending for '%s'",
                      ev.channel_id, ev.message_id, ch_title)
             headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
             async with httpx.AsyncClient(timeout=15) as c:
+                # Step 1: close any open positions (fills the filled leg of limit orders)
+                await c.post(
+                    f"{BRIDGE_URL}/close_channel",
+                    json={"comment": ch_title or str(ev.channel_id),
+                          "pending_only": False},
+                    headers=headers,
+                )
+                # Step 2: cancel remaining pending orders (unfilled limit/stop orders)
                 await c.post(
                     f"{BRIDGE_URL}/close_channel",
                     json={"comment": ch_title or str(ev.channel_id),
                           "pending_only": True},
                     headers=headers,
                 )
-            await alert(f"TP3 hit — cancelled pending for {ch_title}: {ev.text[:200]}")
+            await alert(f"TP3 hit — closed positions + cancelled pending for {ch_title}: {ev.text[:200]}")
             return {"status": "tp3_hit_cleaned", "channel": ch_title}
 
     # ===== 2. ROUTE TO PARSER =====
@@ -580,9 +588,14 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             # Reject signals with msg_id <= current signal's msg_id (out-of-order delivery)
             current = channel_state.current_signal(str(ev.channel_id))
             if current and ev.message_id <= current.get("msg_id", 0):
-                log.info("Skipping %s:%s — msg_id %s <= current %s (out of order)",
-                         ev.channel_id, ev.message_id, ev.message_id, current.get("msg_id"))
-                return {"status": "skipped", "reason": f"msg_id {ev.message_id} <= current {current.get('msg_id')} (out of order)"}
+                cur_id = current.get("msg_id", 0)
+                if cur_id > 500000 and ev.message_id < 100000:
+                    log.warning("msg_id rollover for %s: stored=%s, new=%s — accepting signal",
+                                ev.channel_id, cur_id, ev.message_id)
+                else:
+                    log.info("Skipping %s:%s — msg_id %s <= current %s (out of order)",
+                             ev.channel_id, ev.message_id, ev.message_id, cur_id)
+                    return {"status": "skipped", "reason": f"msg_id {ev.message_id} <= current {cur_id} (out of order)"}
 
             # --- a) Pre-emptively cancel lingering pending orders from previous signals ---
             # Prevents old pending orders (e.g. BUY LIMIT from 7h ago) from surviving
@@ -780,10 +793,11 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 "from_image": is_image,
                 "timestamp": ev.date,
             }
-            is_pending = sig.get("pending_tp", False)
-            if is_pending:
-                update["pending_tp"] = True
+            # Always save tickets from bridge response — needed for exclude_tickets in close_channel
+            if ticket_ids:
                 update["tickets"] = ticket_ids
+            if sig.get("pending_tp", False):
+                update["pending_tp"] = True
             channel_state.update(str(ev.channel_id), update)
         elif sig.get("manage_op") == "modify_tp":
             # Clear pending_tp, store real TP
