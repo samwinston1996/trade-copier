@@ -473,25 +473,27 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     if ev.text and TP3_HIT_PATTERN.search(ev.text):
         current = channel_state.current_signal(str(ev.channel_id))
         if current and len(current.get("tp", [])) >= 3:
-            log.info("TP3 hit for %s:%s — closing positions and cancelling pending for '%s'",
+            log.info("TP3 hit for %s:%s — booking profit + cancelling pending for '%s'",
                      ev.channel_id, ev.message_id, ch_title)
             headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
             async with httpx.AsyncClient(timeout=15) as c:
-                # Step 1: close any open positions (fills the filled leg of limit orders)
+                # Step 1: Secure profit + move remaining SL to breakeven
+                # close_and_be books 50% remaining lot, moves SL to entry.
+                # If all lots already closed by TPs, this is a no-op.
                 await c.post(
-                    f"{BRIDGE_URL}/close_channel",
+                    f"{BRIDGE_URL}/manage",
                     json={"comment": ch_title or str(ev.channel_id),
-                          "pending_only": False},
+                          "op": "close_and_be", "value": 50},
                     headers=headers,
                 )
-                # Step 2: cancel remaining pending orders (unfilled limit/stop orders)
+                # Step 2: Cancel remaining pending orders (unfilled limit/stop orders)
                 await c.post(
                     f"{BRIDGE_URL}/close_channel",
                     json={"comment": ch_title or str(ev.channel_id),
                           "pending_only": True},
                     headers=headers,
                 )
-            await alert(f"TP3 hit — closed positions + cancelled pending for {ch_title}: {ev.text[:200]}")
+            await alert(f"TP3 hit — booked profit + cancelled pending for {ch_title}: {ev.text[:200]}")
             return {"status": "tp3_hit_cleaned", "channel": ch_title}
 
     # ===== 2. ROUTE TO PARSER =====
