@@ -532,6 +532,8 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 raise HTTPException(502, f"parse failed: {e}")
 
     else:
+        log.warning("Empty message for channel %s msg %s — no text, no image, no payload data",
+                     ev.channel_id, ev.message_id)
         return {"status": "ignored", "reason": "empty message — no text or image"}
 
     # ===== 3. PROCESS PARSED RESULT =====

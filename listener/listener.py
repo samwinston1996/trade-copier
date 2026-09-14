@@ -175,6 +175,16 @@ async def make_payload_from_msg(msg, channel_id: int, kind: str) -> dict:
                 log.info("Hydrated caption for msg %s: %.80r", msg.id, text)
         except Exception as e:
             log.debug("Caption re-fetch failed for msg %s: %s", msg.id, e)
+    # Also retry text-only messages with empty text (Telethon polling quirk)
+    elif not text.strip():
+        try:
+            entity = await client.get_entity(channel_id)
+            refreshed = await client.get_messages(entity, ids=msg.id)
+            if refreshed and refreshed.message:
+                text = refreshed.message
+                log.info("Refreshed text for msg %s: %.80r", msg.id, text)
+        except Exception as e:
+            log.debug("Text re-fetch failed for msg %s: %s", msg.id, e)
     payload = {
         "event": kind,
         "channel_id": channel_id,
