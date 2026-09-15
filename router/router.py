@@ -541,6 +541,21 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
     conf = float(sig.get("confidence", 0))
     log.info("parsed %s:%s -> %s conf=%.2f", ev.channel_id, ev.message_id, action, conf)
 
+    # ── AK Capital Phase 1: signals with "Tp will update" → force pending_tp ──
+    if ev.channel_id == AK_CAPITAL_ID and action in ("BUY", "SELL"):
+        tp_list = sig.get("tp", [])
+        if isinstance(tp_list, (int, float)):
+            tp_list = [tp_list]
+        has_tp = bool(tp_list) and not all(t == 0 for t in tp_list)
+        text_lower = (ev.text or "").lower()
+        if not has_tp and re.search(r'(tp will update|tp later|tp follow|tp soon)', text_lower):
+            sig["pending_tp"] = True
+            if conf < 0.7:
+                conf = 0.7
+                sig["confidence"] = 0.7
+            log.info("AK Capital Phase 1 for %s:%s — pending_tp=True (TP to follow later)",
+                     ev.channel_id, ev.message_id)
+
     if action == "IGNORE":
         return {"status": "ignored", "signal": sig}
 
@@ -583,6 +598,23 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                         ev.channel_id, ev.message_id, sl_distance)
             await alert(f"Trade.inn signal rejected: SL too tight ({sl_distance:.0f} pips, min 50)")
             return {"status": "ignored", "reason": f"SL too tight: {sl_distance:.0f} pips (min 50)"}
+
+    # ── Signal edit guard: skip edits that haven't changed the trade ──
+    # Prevents edit-triggered pre-emptive cancel from killing orders just placed by the
+    # original new event. Only proceed with an edit if the signal content actually changed.
+    if ev.event == "edit" and action in ("BUY", "SELL"):
+        current = channel_state.current_signal(str(ev.channel_id))
+        if current and current.get("msg_id") == ev.message_id:
+            same_action = current.get("action") == action
+            same_entry = abs((current.get("entry") or 0) - (sig.get("entry") or 0)) < 0.01
+            same_sl = abs((current.get("sl") or 0) - (sig.get("sl") or 0)) < 0.01
+            old_tps = sorted(current.get("tp", []) or [])
+            new_tps = sorted(sig.get("tp", []) or [])
+            same_tp = old_tps == new_tps
+            if same_action and same_entry and same_sl and same_tp:
+                log.info("Edit for %s:%s — signal unchanged (same action/entry/SL/TP), ignoring edit",
+                         ev.channel_id, ev.message_id)
+                return {"status": "ignored", "reason": "edit unchanged"}
 
     # ===== 4. FORWARD TO BRIDGE =====
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
@@ -659,6 +691,9 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                     log.info("Bridge returned duplicate_ignored for %s:%s — skipping close_channel",
                              ev.channel_id, ev.message_id)
                 log.info("Trade placed — tickets: %s", ticket_ids)
+            else:
+                log.warning("Bridge rejected %s:%s — status=%s body=%s",
+                            ev.channel_id, ev.message_id, r.status_code, r.text[:500])
 
             # --- d) THEN conditionally close old positions + cancel old orders ---
             # Guard (Fix B): skip close_channel if no tickets to exclude (prevents self-cancellation)
