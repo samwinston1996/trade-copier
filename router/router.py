@@ -618,6 +618,11 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
 
     # ===== 4. FORWARD TO BRIDGE =====
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+    # Dedup set for manage_ops — prevents the same MODIFY/tp-update from executing
+    # multiple times when Telethon delivers the same message repeatedly.
+    processed_manage_ops: set = getattr(app, "_processed_manage_ops", set())
+    if not hasattr(app, "_processed_manage_ops"):
+        app._processed_manage_ops = processed_manage_ops
     async with httpx.AsyncClient(timeout=30) as c:
         if action in ("BUY", "SELL"):
             # --- Msg_id monotonicity guard ---
@@ -735,7 +740,16 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                          ev.channel_id, ev.message_id,
                          "no tickets returned" if not ticket_ids else "same signal as previous")
 
-        elif sig.get("manage_op") == "modify_tp":
+        # ── Manage-op dedup: same channel+msg+op delivered multiple times → skip ──
+        if sig.get("manage_op"):
+            dedup_key = f"{ev.channel_id}:{ev.message_id}:{sig['manage_op']}"
+            if dedup_key in processed_manage_ops:
+                log.info("Skipping %s:%s — %s already processed (dup delivery)",
+                         ev.channel_id, ev.message_id, sig["manage_op"])
+                return {"status": "skipped", "reason": f"duplicate manage_op: {sig['manage_op']}"}
+            processed_manage_ops.add(dedup_key)
+
+        if sig.get("manage_op") == "modify_tp":
             # AK Capital Phase 2: modify existing positions' TPs from temp to real
             pending = channel_state.current_signal(str(ev.channel_id))
             title = pending.get("channel_title", ch_source) if pending else ch_source
@@ -763,7 +777,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
             pending = channel_state.current_signal(str(ev.channel_id))
             title = pending.get("channel_title", ch_source) if pending else ch_source
             
-            if pending and pending.get("pending_tp", False):
+            if pending and pending.get("tickets", []):
                 # Phase 2: modify existing temp trades — set real SL + distribute TPs
                 body = {
                     "signal_id": f"{ev.channel_id}:{ev.message_id}",
@@ -848,7 +862,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
         elif sig.get("manage_op") == "modify_signal":
             # StarFx/XAUUSD Phase 2 — clear pending_tp, store real values
             current = channel_state.current_signal(str(ev.channel_id))
-            if current and current.get("pending_tp", False):
+            if current and current.get("tickets", []):
                 current["pending_tp"] = False
                 current["entry"] = sig.get("entry")
                 current["sl"] = sig.get("sl")
