@@ -219,11 +219,10 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 has_tp = bool(re.findall(r'TP\d?:?\s*(\d+\.?\d*)', text, re.I))
                 if not has_tp:
                     # Use MARKET order — bridge will calculate safe temp TP from actual fill
-                    temp_tp = round(entry - 10.0 if action == "SELL" else entry + 10.0, 2)
                     return {
                         "action": action, "symbol": "XAUUSD",
                         "order_type": "market", "entry": None,
-                        "sl": sl, "tp": [temp_tp],
+                        "sl": sl, "tp": [],
                         "confidence": 1.0, "pending_tp": True,
                     }
 
