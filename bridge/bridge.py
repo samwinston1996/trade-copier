@@ -73,7 +73,7 @@ class TradeRequest(BaseModel):
 class ManageRequest(BaseModel):
     signal_id: str
     comment: Optional[str] = None
-    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp", "modify_signal", "close_and_be"]
+    op: Literal["close_all", "close_partial", "sl_to_be", "modify_sl", "modify_tp", "modify_signal", "close_and_be", "tp3_cleanup"]
     value: Optional[float] = None
     tp_values: Optional[str] = None  # JSON array, e.g. "[4655, 4640, 4615]"
 
@@ -544,6 +544,30 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
                 "tp": p.tp,
             })
             out.append({"ticket": p.ticket, "close_retcode": res.retcode if res else -1, "modify_retcode": res2.retcode if res2 else -1})
+            continue
+        elif req.op == "tp3_cleanup":
+            # TP3 hit: close losing positions, move profitable ones to breakeven
+            for p in matched:
+                if p.profit is not None and p.profit < 0:
+                    # Losing trade → close it
+                    tick = mt5.symbol_info_tick(p.symbol)
+                    res = mt5.order_send({
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": p.symbol, "volume": p.volume,
+                        "position": p.ticket,
+                        "type": mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                        "price": tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask,
+                        "deviation": 20, "magic": MAGIC,
+                        "type_filling": mt5.ORDER_FILLING_FOK,
+                    })
+                else:
+                    # Profitable or flat → move SL to entry (breakeven)
+                    res = mt5.order_send({
+                        "action": mt5.TRADE_ACTION_SLTP,
+                        "position": p.ticket, "symbol": p.symbol,
+                        "sl": p.price_open, "tp": p.tp,
+                    })
+                out.append({"ticket": p.ticket, "retcode": res.retcode if res else -1})
             continue
         else:
             new_sl = p.price_open if req.op == "sl_to_be" else req.value

@@ -47,8 +47,8 @@ Rules:
 - Normalize symbols: GOLD/XAU -> XAUUSD, DOW -> US30, NAS -> NAS100. Uppercase.
 - Commentary, recaps, ads, results screenshots, greetings, "Good morning", "XAU/USD ANALYSIS", market views -> action IGNORE.
 - NEVER invent prices. If SL or TP is missing for BUY/SELL, set confidence <= 0.3.
-- "close", "take profit now", "secure partials", "SL to breakeven", "move SL to X" -> CLOSE or MODIFY with manage_op.
-- BREAKEVEN DETECTION: Messages like "set breakeven", "use breakeven", "move SL to breakeven", "secure your profit & move SL to BE", "secure X% profits by closing partial", "book profit", "move to breakeven" → action=MODIFY, manage_op="close_and_be", partial_pct=50. This books 50% profit and moves remaining SL to entry.
+- "close", "take profit now", "book profit", "secure partials" -> MODIFY with manage_op="close_all" or "close_partial".
+- BREAKEVEN DETECTION: Messages like "set breakeven", "use breakeven", "move SL to breakeven", "SL to breakeven", "secure your profit & move SL to BE", "move to breakeven" → action=MODIFY, manage_op="sl_to_be". This moves SL to entry price WITHOUT closing any position. The trade continues running and closes naturally when TP is hit.
 - Common signal format: "Entry: X", "Stop Loss: X" (or "SL: X"), "TP1: X" (or "Target: X", "TP: X"). Parse these correctly.
 - Handle emoji-prefixed fields: "💎TP¹ 4092" → TP=4092, "#⃣SL 4073" → SL=4073, "💻XAUUSD BUY 4088" → BUY entry=4088
 - For structured text signals with labeled fields (Entry:, Stop Loss:, TP:), extract the exact numbers after each label.
@@ -189,8 +189,7 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
         if m:
             return {
                 "action": "MODIFY", "symbol": "XAUUSD",
-                "manage_op": "close_and_be",
-                "partial_pct": 50,
+                "manage_op": "sl_to_be",
                 "confidence": 1.0,
             }
 
@@ -331,13 +330,12 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
                 "confidence": 1.0, "pending_tp": True,
             }
 
-        # — StarFx Breakeven: "Secure your profit & move SLto BE"
-        m = re.search(r'(?:Secure your profit|move SLto BE)', text, re.I)
+        # — StarFx Breakeven: "Secure your profit & move SLto BE" and variants
+        m = re.search(r'(?:Secure(?: your)? profit|move\s*SL\s*to\s*BE|secure.*profit.*SL)', text, re.I)
         if m:
             return {
                 "action": "MODIFY", "symbol": "XAUUSD",
-                "manage_op": "close_and_be",
-                "partial_pct": 50,
+                "manage_op": "sl_to_be",
                 "confidence": 1.0,
             }
 
@@ -376,8 +374,7 @@ def parse_with_regex(text: str, channel_id: int = 0) -> dict | None:
         if m:
             return {
                 "action": "MODIFY", "symbol": "XAUUSD",
-                "manage_op": "close_and_be",
-                "partial_pct": 50,
+                "manage_op": "sl_to_be",
                 "confidence": 1.0,
             }
 
@@ -476,13 +473,11 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                      ev.channel_id, ev.message_id, ch_title)
             headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
             async with httpx.AsyncClient(timeout=15) as c:
-                # Step 1: Secure profit + move remaining SL to breakeven
-                # close_and_be books 50% remaining lot, moves SL to entry.
-                # If all lots already closed by TPs, this is a no-op.
+                # Step 1: Close losing positions + move profitable positions to breakeven
                 await c.post(
                     f"{BRIDGE_URL}/manage",
                     json={"comment": ch_title or str(ev.channel_id),
-                          "op": "close_and_be", "value": 50},
+                          "op": "tp3_cleanup"},
                     headers=headers,
                 )
                 # Step 2: Cancel remaining pending orders (unfilled limit/stop orders)

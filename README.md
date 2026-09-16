@@ -106,8 +106,8 @@ The bridge evaluates the current market price against the signal entry and autom
 - **MARKET** when entry is within 20 pips of current price
 - 20-pip threshold ensures orders are placed efficiently without unnecessary pending orders. — *Commits `181cb04`, `d1c0768`, `d52c37e`*
 
-### 💰 Automated Breakeven + Profit Booking
-When a trade channel explicitly instructs to set breakeven or book profits, the system automatically **closes 50% of the position and moves the remaining SL to entry price** — all in a single atomic bridge call (`close_and_be`). Four channels have dedicated regex pre-filters (AK Capital, StarFx, Paul GOLD, Trading Central), and the LLM prompt has been enhanced to catch breakeven language on any channel. Zero LLM cost for regex-matched channels. — *Current release*
+### 📐 Breakeven Handling
+When a trade channel explicitly instructs to set breakeven, the system **moves the SL to entry price** without closing any position. The trade continues running and closes naturally when TP is hit. AK Capital VIP is the **only** channel where breakeven also books 50% profit (`close_and_be`). Four channels have dedicated regex pre-filters (AK Capital, StarFx, Paul GOLD, Trading Central), and the LLM prompt handles breakeven language on any channel. Zero LLM cost for regex-matched channels. — *Current release*
 
 ### Configuration
 
@@ -179,14 +179,14 @@ Six pipeline fixes: trailing-space strip at source, pipe→hyphen conversion, 30
 ### V2.0 — Photo Caption Hydration + TP Direction Validation
 **Root-cause fix for Paul GOLD Dominator + Trade.inn + XAU/USD Analysis signal drops.** Messages posted with photo + text caption arrived at the router with empty text because Telethon's `get_messages(limit=1)` intermittently omits the caption field for media messages. Listener now re-fetches by message ID to hydrate the caption before pushing. Bridge now validates TP direction per trade side (BUY → TPs above entry, SELL → TPs below), filtering invalid TPs instead of returning MT5 retcode 10016 / 500s.
 
-### V2.1 — Breakeven + Profit Booking (`close_and_be`)
-**Four channels now auto-book 50% profit + move remaining to breakeven** when the group shares breakeven/profit-booking instructions. New bridge op `close_and_be` atomically closes 50% volume and moves the remaining position's SL to entry price in a single call. Per-channel regex pre-filters:
+### V2.1 — Breakeven + Profit Booking (`sl_to_be` / `close_and_be`)
+**Breakeven now moves SL to entry without closing positions** (except AK Capital). Four channels have regex pre-filters. New bridge op `tp3_cleanup` handles TP3-hit events (close losers, move winners to breakeven). Per-channel regex patterns:
 
-| Channel | Trigger | Test Coverage |
-|---------|---------|--------------|
-| **AK Capital** | `set breakeven`, `use breakeven`, `move SL to breakeven` (excludes `not set breakeven`) | 5 positive, 1 negative |
-| **StarFx** | `Secure your profit & move SLto BE` | 3 positive, 0 false positives |
-| **Paul GOLD** | `set breakeven to minimize risk` | 2 positive, 0 false positives |
-| **Trading Central** | `secure X% profits by closing partial` | 1 positive, 0 false positives |
+| Channel | Trigger | Action |
+|---------|---------|--------|
+| **AK Capital** | `set breakeven`, `use breakeven`, `move SL to breakeven` (excludes `not set breakeven`) | `close_and_be` — close 50% + move SL to entry |
+| **StarFx** | `Secure your profit`, `move SL to BE`, `secure...profit...SL` | `sl_to_be` — move SL to entry only |
+| **Paul GOLD** | `set breakeven to minimize risk` | `sl_to_be` — move SL to entry only |
+| **Trading Central** | `secure X% profits by closing partial` | `sl_to_be` — move SL to entry only |
 
-LLM prompt also enhanced to recognize breakeven language for any channel not caught by regex. All patterns validated against real message history (50 msgs/channel, 3 days). — *Current release*
+LLM prompt detects breakeven language (`sl_to_be`) and close language (`close_all`/`close_partial`) as separate operations — no longer conflated. — *Current release*
