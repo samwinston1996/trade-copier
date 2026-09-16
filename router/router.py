@@ -477,6 +477,7 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 await c.post(
                     f"{BRIDGE_URL}/manage",
                     json={"comment": ch_title or str(ev.channel_id),
+                          "signal_id": f"{ev.channel_id}:{ev.message_id}",
                           "op": "tp3_cleanup"},
                     headers=headers,
                 )

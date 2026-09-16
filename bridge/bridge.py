@@ -50,6 +50,21 @@ def sanitize_comment(comment: str) -> str:
     return s
 
 
+def safe_comment_key(comment: str, signal_id: str = "") -> str:
+    """Return a non-empty ASCII comment key for MT5 matching.
+    Falls back to channel_id from signal_id when comment has no ASCII content.
+    Prevents empty comment key from matching ALL positions."""
+    key = sanitize_comment(comment or "")
+    key = re.sub(r'[^\x00-\x7F]+', '', key).strip()
+    if not key:
+        if signal_id:
+            parts = signal_id.split(":")
+            key = f"chan_{parts[0]}"
+        else:
+            key = "chan_unknown"
+    return key[:30]
+
+
 app = FastAPI(title="MT5 Bridge")
 
 executed_signals: set[str] = set()
@@ -183,7 +198,7 @@ def close_channel(req: CloseChannelRequest, authorization: str = Header(None)):
     mt5 = ensure_mt5()
     comment = sanitize_comment(req.comment)
     # Strip non-ASCII (emojis, etc.) for MT5 matching — MT5 silently drops them
-    comment_key = re.sub(r'[^\x00-\x7F]+', '', comment).strip()
+    comment_key = safe_comment_key(req.comment)
     closed = []
     cancelled = []
 
@@ -283,10 +298,10 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
             raise HTTPException(429, "max global trades reached")
 
         # Per-channel trade cap
-        comment = sanitize_comment(req.comment)
+        comment_key = safe_comment_key(req.comment, req.signal_id)
         channel_positions = [
             p for p in iterate_safe(mt5.positions_get())
-            if comment in sanitize_comment(p.comment or "")
+            if comment_key in safe_comment_key(p.comment or "")
         ]
         if len(channel_positions) >= MAX_PER_CHANNEL:
             raise HTTPException(429, f"max {MAX_PER_CHANNEL} trades reached for channel '{req.comment}'")
@@ -388,7 +403,7 @@ def trade(req: TradeRequest, authorization: str = Header(None)):
                 "tp": tp,
                 "deviation": 20,
                 "magic": MAGIC,
-                "comment": sanitize_comment(req.comment)[:30],
+                "comment": safe_comment_key(req.comment, req.signal_id),
                 "type_time": mt5.ORDER_TIME_GTC,
             }
             if is_market:
@@ -457,7 +472,7 @@ def manage(req: ManageRequest, authorization: str = Header(None)):
     
     # Match by comment (channel_title) if provided, otherwise by signal_id
     if req.comment:
-        comment_key = re.sub(r'[^\x00-\x7F]+', '', sanitize_comment(req.comment)).strip()
+        comment_key = safe_comment_key(req.comment, req.signal_id)
         matched = [
             p for p in (mt5.positions_get() or [])
             if comment_key in re.sub(r'[^\x00-\x7F]+', '', sanitize_comment(p.comment or ""))
