@@ -610,6 +610,36 @@ async def webhook(ev: ListenerEvent, authorization: str = Header(None)):
                 log.info("Edit for %s:%s — signal unchanged (same action/entry/SL/TP), ignoring edit",
                          ev.channel_id, ev.message_id)
                 return {"status": "ignored", "reason": "edit unchanged"}
+            
+            # Changed but same direction + has open positions → modify SL/TP instead of reopening
+            if same_action and current.get("tickets", []):
+                log.info("Edit for %s:%s — signal changed, modifying existing positions (SL/TP update)",
+                         ev.channel_id, ev.message_id)
+                headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+                title = ch_title or str(ev.channel_id)
+                async with httpx.AsyncClient(timeout=15) as c:
+                    # Update SL if changed
+                    sl_val = sig.get("sl")
+                    if sl_val is not None and (current.get("sl") is None or abs(current["sl"] - sl_val) >= 0.01):
+                        await c.post(f"{BRIDGE_URL}/manage", json={
+                            "comment": title, "signal_id": f"{ch_source}:{ev.message_id}",
+                            "op": "modify_sl", "value": sl_val
+                        }, headers=headers)
+                    # Update TP if changed
+                    if not same_tp and new_tps:
+                        await c.post(f"{BRIDGE_URL}/manage", json={
+                            "comment": title, "signal_id": f"{ch_source}:{ev.message_id}",
+                            "op": "modify_tp", "tp_values": json.dumps(new_tps[:3])
+                        }, headers=headers)
+                    # Update channel state
+                    update = {"msg_id": ev.message_id, "timestamp": ev.date}
+                    if sl_val is not None:
+                        update["sl"] = sl_val
+                    if new_tps:
+                        update["tp"] = new_tps[:3]
+                    channel_state.update(str(ev.channel_id), current | update)
+                    await alert(f"Modified via edit: {ch_title}: updated SL/TP from edit msg#{ev.message_id}")
+                return {"status": "modified_via_edit"}
 
     # ===== 4. FORWARD TO BRIDGE =====
     headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}

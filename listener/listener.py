@@ -133,13 +133,33 @@ async def download_image(event) -> str | None:
 async def make_payload(event, kind: str) -> dict:
     m = event.message
     chat = getattr(event, "chat", None)
+    # Hydrate caption: if msg has media but empty text, re-fetch by ID
+    text = m.message or ""
+    if not text.strip() and m.media is not None:
+        try:
+            entity = await client.get_entity(event.chat_id)
+            hydrated = await client.get_messages(entity, ids=m.id)
+            if hydrated and hydrated.message:
+                text = hydrated.message
+                log.info("Hydrated caption for msg %s: %.80r", m.id, text)
+        except Exception as e:
+            log.debug("Caption re-fetch failed for msg %s: %s", m.id, e)
+    elif not text.strip():
+        try:
+            entity = await client.get_entity(event.chat_id)
+            refreshed = await client.get_messages(entity, ids=m.id)
+            if refreshed and refreshed.message:
+                text = refreshed.message
+                log.info("Refreshed text for msg %s: %.80r", m.id, text)
+        except Exception as e:
+            log.debug("Text re-fetch failed for msg %s: %s", m.id, e)
     payload = {
         "event": kind,
         "channel_id": event.chat_id,
         "channel_title": chat.title if chat else "",
         "message_id": m.id,
         "reply_to_id": m.reply_to_msg_id,
-        "text": m.message or "",
+        "text": text,
         "has_media": m.media is not None,
         "date": m.date.isoformat(),
     }
